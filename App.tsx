@@ -1,123 +1,125 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { signOut } from 'firebase/auth';
 
-import { getHealth } from './src/services/api';
+import { useAuth } from './src/hooks/useAuth';
+import { auth } from './src/services/firebase';
+import { mensajeDeErrorAuth } from './src/services/authErrors';
+import LoginScreen from './src/screens/LoginScreen';
+import RegisterScreen from './src/screens/RegisterScreen';
 
 /**
- * PANTALLA TEMPORAL — solo verifica la conexión con el backend end-to-end.
- * Sustituir por la pantalla real cuando la conexión esté confirmada.
+ * Enrutado provisional. Sustituir por React Navigation en la siguiente fase:
+ * useAuth decide entre el flujo autenticado y el de acceso, y un useState local
+ * alterna entre login y registro mientras no hay sesión.
  */
-
-type Status =
-  | { state: 'loading' }
-  | { state: 'ok'; data: unknown }
-  | { state: 'error'; message: string };
-
 export default function App() {
-  const [status, setStatus] = useState<Status>({ state: 'loading' });
+  const { user, loading } = useAuth();
+  const [pantalla, setPantalla] = useState<'login' | 'registro'>('login');
 
-  useEffect(() => {
-    let cancelled = false;
+  if (loading) {
+    return (
+      <View style={styles.centered}>
+        <ActivityIndicator />
+        <Text style={styles.muted}>Cargando…</Text>
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
 
-    getHealth()
-      .then((data) => {
-        if (!cancelled) setStatus({ state: 'ok', data });
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setStatus({
-            state: 'error',
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      });
+  if (!user) {
+    return (
+      <>
+        {pantalla === 'login' ? (
+          <LoginScreen onIrARegistro={() => setPantalla('registro')} />
+        ) : (
+          <RegisterScreen onIrALogin={() => setPantalla('login')} />
+        )}
+        <StatusBar style="auto" />
+      </>
+    );
+  }
 
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  return <SesionIniciada email={user.email} />;
+}
+
+/**
+ * PANTALLA TEMPORAL — solo confirma que el ciclo login/registro/logout funciona
+ * de punta a punta. Sustituir por la app real (navegación + pantallas) después.
+ */
+function SesionIniciada({ email }: { email: string | null }) {
+  const [error, setError] = useState<string | null>(null);
+
+  async function cerrarSesion() {
+    setError(null);
+    try {
+      // No hay que limpiar nada más: onAuthStateChanged pone user en null y App
+      // vuelve al login solo.
+      await signOut(auth);
+    } catch (e: unknown) {
+      setError(mensajeDeErrorAuth(e));
+    }
+  }
 
   return (
-    <View style={styles.container}>
-      <ScrollView contentContainerStyle={styles.content}>
-        <Text style={styles.title}>Conexión con el backend</Text>
-        <Text style={styles.url}>{process.env.EXPO_PUBLIC_API_URL ?? '(sin EXPO_PUBLIC_API_URL)'}</Text>
+    <View style={styles.centered}>
+      {/* email es null si la cuenta se creó con un proveedor sin correo (teléfono,
+          anónimo). Hoy no ocurre, pero el tipo de Firebase lo admite. */}
+      <Text style={styles.title}>Sesión iniciada como {email ?? '(sin correo)'}</Text>
 
-        {status.state === 'loading' && (
-          <View style={styles.row}>
-            <ActivityIndicator />
-            <Text style={styles.pending}>Llamando a /health…</Text>
-          </View>
-        )}
+      {error !== null && <Text style={styles.error}>{error}</Text>}
 
-        {status.state === 'ok' && (
-          <>
-            <Text style={styles.ok}>✓ Backend accesible</Text>
-            <Text style={styles.json}>{JSON.stringify(status.data, null, 2)}</Text>
-          </>
-        )}
+      <Pressable
+        style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]}
+        onPress={cerrarSesion}
+      >
+        <Text style={styles.buttonText}>Cerrar sesión</Text>
+      </Pressable>
 
-        {status.state === 'error' && (
-          <>
-            <Text style={styles.error}>✗ Sin conexión</Text>
-            <Text style={styles.json}>{status.message}</Text>
-          </>
-        )}
-      </ScrollView>
       <StatusBar style="auto" />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
+  centered: {
     flex: 1,
     backgroundColor: '#fff',
-  },
-  content: {
-    flexGrow: 1,
-    justifyContent: 'center',
-    padding: 24,
-    gap: 12,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  url: {
-    fontSize: 13,
-    color: '#666',
-    textAlign: 'center',
-  },
-  row: {
-    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
+    padding: 24,
+    gap: 16,
   },
-  pending: {
+  title: {
+    fontSize: 18,
+    fontWeight: '600',
+    textAlign: 'center',
+    color: '#18181b',
+  },
+  muted: {
     color: '#666',
   },
-  ok: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#15803d',
-    textAlign: 'center',
-  },
   error: {
-    fontSize: 16,
-    fontWeight: '600',
     color: '#b91c1c',
-    textAlign: 'center',
-  },
-  json: {
-    fontFamily: 'monospace',
-    fontSize: 13,
-    backgroundColor: '#f4f4f5',
+    fontSize: 14,
+    backgroundColor: '#fef2f2',
     borderRadius: 8,
     padding: 12,
+    textAlign: 'center',
+  },
+  button: {
+    backgroundColor: '#e4e4e7',
+    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+  },
+  buttonPressed: {
+    opacity: 0.85,
+  },
+  buttonText: {
     color: '#18181b',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
