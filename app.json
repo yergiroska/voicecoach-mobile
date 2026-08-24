@@ -27,7 +27,13 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Permite que $(PRODUCT_NAME) use el micrófono para grabar tu voz."
+        }
+      ]
     ]
   }
 }
