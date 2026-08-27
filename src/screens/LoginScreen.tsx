@@ -14,13 +14,9 @@ import { signInWithEmailAndPassword } from 'firebase/auth';
 
 import { auth } from '../services/firebase';
 import { mensajeDeErrorAuth } from '../services/authErrors';
+import type { AuthStackScreenProps } from '../navigation/types';
 
-type Props = {
-  /** Navegación provisional: la maneja App.tsx hasta que montemos React Navigation. */
-  onIrARegistro: () => void;
-};
-
-export default function LoginScreen({ onIrARegistro }: Props) {
+export default function LoginScreen({ navigation }: AuthStackScreenProps<'Login'>) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -110,7 +106,7 @@ export default function LoginScreen({ onIrARegistro }: Props) {
           )}
         </Pressable>
 
-        <Pressable onPress={onIrARegistro} disabled={enviando} hitSlop={8}>
+        <Pressable onPress={() => navigation.navigate('Register')} disabled={enviando} hitSlop={8}>
           <Text style={styles.link}>¿No tienes cuenta? Regístrate</Text>
         </Pressable>
       </ScrollView>

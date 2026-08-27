@@ -14,16 +14,12 @@ import { createUserWithEmailAndPassword } from 'firebase/auth';
 
 import { auth } from '../services/firebase';
 import { mensajeDeErrorAuth } from '../services/authErrors';
+import type { AuthStackScreenProps } from '../navigation/types';
 
 /** Mínimo que exige Firebase. Validarlo aquí evita un ida y vuelta a la red. */
 const MIN_PASSWORD = 6;
 
-type Props = {
-  /** Navegación provisional: la maneja App.tsx hasta que montemos React Navigation. */
-  onIrALogin: () => void;
-};
-
-export default function RegisterScreen({ onIrALogin }: Props) {
+export default function RegisterScreen({ navigation }: AuthStackScreenProps<'Register'>) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmacion, setConfirmacion] = useState('');
@@ -144,7 +140,7 @@ export default function RegisterScreen({ onIrALogin }: Props) {
           )}
         </Pressable>
 
-        <Pressable onPress={onIrALogin} disabled={enviando} hitSlop={8}>
+        <Pressable onPress={() => navigation.goBack()} disabled={enviando} hitSlop={8}>
           <Text style={styles.link}>¿Ya tienes cuenta? Inicia sesión</Text>
         </Pressable>
       </ScrollView>

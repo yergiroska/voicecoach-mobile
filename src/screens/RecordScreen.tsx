@@ -1,7 +1,9 @@
 import { useState } from 'react';
-import { Linking, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, Linking, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { usePreventRemove } from '@react-navigation/native';
 
 import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
+import type { AppStackScreenProps } from '../navigation/types';
 
 /** Milisegundos a m:ss, para mostrar la duración de forma legible. */
 function formatearDuracion(millis: number): string {
@@ -11,7 +13,7 @@ function formatearDuracion(millis: number): string {
   return `${minutos}:${String(segundos).padStart(2, '0')}`;
 }
 
-export default function RecordScreen() {
+export default function RecordScreen({ navigation }: AppStackScreenProps<'Record'>) {
   const {
     isRecording,
     durationMillis,
@@ -39,10 +41,44 @@ export default function RecordScreen() {
     }
   }
 
+  /**
+   * Intercepta cualquier salida de la pantalla mientras se graba: la flecha del
+   * header, el back de hardware de Android, el gesto de swipe de iOS y nuestro
+   * propio goBack(). React Navigation nos entrega en `data.action` la acción que
+   * bloqueó, y salir consiste en volver a despacharla.
+   *
+   * No se cancela la grabación al salir, se cierra: sin el stop() el recorder
+   * nativo se queda con el micrófono abierto cuando la pantalla se desmonta.
+   */
+  usePreventRemove(isRecording, ({ data }) => {
+    async function detenerYSalir() {
+      setOcupado(true);
+      try {
+        await stopRecording();
+      } finally {
+        // En el finally, no después del await: si stop() falla no queremos
+        // dejar al usuario atrapado en la pantalla.
+        navigation.dispatch(data.action);
+      }
+    }
+
+    // Alert.alert no hace nada en react-native-web, así que ahí el diálogo
+    // nativo del navegador es la única forma de no bloquear la salida.
+    if (Platform.OS === 'web') {
+      if (window.confirm('Estás grabando. ¿Detener la grabación y salir?')) {
+        void detenerYSalir();
+      }
+      return;
+    }
+
+    Alert.alert('Estás grabando', '¿Detener la grabación y salir de esta pantalla?', [
+      { text: 'Seguir grabando', style: 'cancel' },
+      { text: 'Detener y salir', style: 'destructive', onPress: () => void detenerYSalir() },
+    ]);
+  });
+
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Grabar voz</Text>
-
       <View style={styles.statusBox}>
         <Text style={[styles.status, isRecording && styles.statusRecording]}>
           {isRecording ? 'Grabando…' : 'Sin grabar'}
@@ -90,6 +126,21 @@ export default function RecordScreen() {
           </Text>
         </View>
       )}
+
+      {/* El header nativo ya trae la flecha de atrás y el gesto de swipe; este es
+          el camino explícito. No se deshabilita durante la grabación: goBack()
+          pasa igualmente por usePreventRemove y sale el diálogo. */}
+      <Pressable
+        style={({ pressed }) => [
+          styles.backButton,
+          pressed && styles.buttonPressed,
+          ocupado && styles.buttonDisabled,
+        ]}
+        onPress={() => navigation.goBack()}
+        disabled={ocupado}
+      >
+        <Text style={styles.backButtonText}>Volver a Home</Text>
+      </Pressable>
     </View>
   );
 }
@@ -101,12 +152,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
     gap: 20,
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: '600',
-    textAlign: 'center',
-    color: '#18181b',
   },
   statusBox: {
     alignItems: 'center',
@@ -182,5 +227,18 @@ const styles = StyleSheet.create({
   resultUri: {
     fontSize: 11,
     color: '#71717a',
+  },
+  backButton: {
+    backgroundColor: '#e4e4e7',
+    borderRadius: 8,
+    paddingVertical: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 50,
+  },
+  backButtonText: {
+    color: '#18181b',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
