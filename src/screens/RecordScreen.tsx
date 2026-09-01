@@ -1,8 +1,18 @@
 import { useState } from 'react';
-import { Alert, Linking, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Alert,
+  Linking,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { usePreventRemove } from '@react-navigation/native';
 
 import { useVoiceRecorder } from '../hooks/useVoiceRecorder';
+import { uploadRecording, type UploadedRecording } from '../services/api';
 import type { AppStackScreenProps } from '../navigation/types';
 
 /** Milisegundos a m:ss, para mostrar la duración de forma legible. */
@@ -12,6 +22,25 @@ function formatearDuracion(millis: number): string {
   const segundos = totalSegundos % 60;
   return `${minutos}:${String(segundos).padStart(2, '0')}`;
 }
+
+/** Bytes a KB/MB, para comprobar de un vistazo que subió lo que se grabó. */
+function formatearTamano(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const kb = bytes / 1024;
+  return kb < 1024 ? `${Math.round(kb)} KB` : `${(kb / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * Estado de la subida como unión discriminada: así el resultado y el mensaje de
+ * error no pueden existir a la vez, ni quedar colgando de una subida anterior.
+ */
+type EstadoSubida =
+  | { estado: 'inactiva' }
+  | { estado: 'subiendo' }
+  | { estado: 'ok'; grabacion: UploadedRecording }
+  | { estado: 'error'; mensaje: string };
 
 export default function RecordScreen({ navigation }: AppStackScreenProps<'Record'>) {
   const {
@@ -27,6 +56,13 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
   // prepare). Sin este flag, dos toques rápidos disparan dos veces la misma
   // transición y el recorder nativo queda en un estado inconsistente.
   const [ocupado, setOcupado] = useState(false);
+  const [subida, setSubida] = useState<EstadoSubida>({ estado: 'inactiva' });
+
+  const subiendo = subida.estado === 'subiendo';
+  // Durante la subida se bloquea la misma interfaz que durante una transición
+  // del recorder: empezar a grabar de nuevo dejaría en vuelo una petición cuyo
+  // resultado ya no correspondería a la grabación que se ve en pantalla.
+  const bloqueado = ocupado || subiendo;
 
   async function alternarGrabacion() {
     setOcupado(true);
@@ -34,10 +70,32 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
       if (isRecording) {
         await stopRecording();
       } else {
+        // Una grabación nueva invalida el resultado de la subida anterior.
+        setSubida({ estado: 'inactiva' });
         await startRecording();
       }
     } finally {
       setOcupado(false);
+    }
+  }
+
+  async function enviarGrabacion() {
+    if (recording === null) {
+      return;
+    }
+
+    setSubida({ estado: 'subiendo' });
+    try {
+      const grabacion = await uploadRecording(recording.uri);
+      setSubida({ estado: 'ok', grabacion });
+    } catch (error) {
+      // uploadRecording ya lanza Error con mensajes pensados para enseñarse tal
+      // cual; el fallback solo cubre que lo lanzado no sea un Error.
+      setSubida({
+        estado: 'error',
+        mensaje:
+          error instanceof Error ? error.message : 'No se pudo enviar la grabación.',
+      });
     }
   }
 
@@ -91,10 +149,10 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
           styles.button,
           isRecording && styles.buttonStop,
           pressed && styles.buttonPressed,
-          ocupado && styles.buttonDisabled,
+          bloqueado && styles.buttonDisabled,
         ]}
         onPress={alternarGrabacion}
-        disabled={ocupado}
+        disabled={bloqueado}
       >
         <Text style={styles.buttonText}>{isRecording ? 'Detener' : 'Grabar'}</Text>
       </Pressable>
@@ -124,6 +182,47 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
           <Text style={styles.resultUri} numberOfLines={2}>
             {recording.uri}
           </Text>
+
+          {/* Una vez subida se retira el botón en vez de deshabilitarlo: no hay
+              motivo para volver a mandar el mismo archivo. */}
+          {subida.estado === 'ok' ? (
+            <View style={styles.success}>
+              <Text style={styles.successTitle}>Enviada al servidor</Text>
+              <Text style={styles.successLine}>
+                {formatearTamano(subida.grabacion.size_bytes)} · {subida.grabacion.content_type}
+              </Text>
+              {/* selectable para poder copiar el ID y buscar la grabación en el
+                  backend mientras se prueba a mano. */}
+              <Text style={styles.successId} selectable numberOfLines={2}>
+                {subida.grabacion.recording_id}
+              </Text>
+            </View>
+          ) : (
+            <Pressable
+              style={({ pressed }) => [
+                styles.uploadButton,
+                pressed && styles.buttonPressed,
+                bloqueado && styles.buttonDisabled,
+              ]}
+              onPress={enviarGrabacion}
+              disabled={bloqueado}
+            >
+              {subiendo ? (
+                <View style={styles.uploadingRow}>
+                  <ActivityIndicator color="#fff" size="small" />
+                  <Text style={styles.buttonText}>Subiendo…</Text>
+                </View>
+              ) : (
+                <Text style={styles.buttonText}>
+                  {subida.estado === 'error' ? 'Reintentar envío' : 'Enviar grabación'}
+                </Text>
+              )}
+            </Pressable>
+          )}
+
+          {subida.estado === 'error' && (
+            <Text style={styles.uploadError}>{subida.mensaje}</Text>
+          )}
         </View>
       )}
 
@@ -134,10 +233,10 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
         style={({ pressed }) => [
           styles.backButton,
           pressed && styles.buttonPressed,
-          ocupado && styles.buttonDisabled,
+          bloqueado && styles.buttonDisabled,
         ]}
         onPress={() => navigation.goBack()}
-        disabled={ocupado}
+        disabled={bloqueado}
       >
         <Text style={styles.backButtonText}>Volver a Home</Text>
       </Pressable>
@@ -213,7 +312,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#f4f4f5',
     borderRadius: 8,
     padding: 12,
-    gap: 4,
+    gap: 8,
   },
   resultTitle: {
     fontSize: 15,
@@ -227,6 +326,42 @@ const styles = StyleSheet.create({
   resultUri: {
     fontSize: 11,
     color: '#71717a',
+  },
+  uploadButton: {
+    backgroundColor: '#16a34a',
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 46,
+  },
+  uploadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  uploadError: {
+    color: '#b91c1c',
+    fontSize: 13,
+  },
+  success: {
+    backgroundColor: '#f0fdf4',
+    borderRadius: 8,
+    padding: 10,
+    gap: 2,
+  },
+  successTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#15803d',
+  },
+  successLine: {
+    fontSize: 13,
+    color: '#166534',
+  },
+  successId: {
+    fontSize: 11,
+    color: '#4d7c0f',
   },
   backButton: {
     backgroundColor: '#e4e4e7',
