@@ -9,6 +9,8 @@
 
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 
+import type { UploadedRecording } from '../services/api';
+
 /** Flujo de acceso: se muestra cuando NO hay usuario. */
 export type AuthStackParamList = {
   Login: undefined;
@@ -19,6 +21,17 @@ export type AuthStackParamList = {
 export type AppStackParamList = {
   Home: undefined;
   Record: undefined;
+  /**
+   * Resultado de una subida: la pantalla solo pinta lo que recibe, no vuelve a
+   * pedirle nada al backend.
+   *
+   * Viaja el objeto entero y no solo el `recording_id` porque la transcripción
+   * llega ya dentro de la respuesta de POST /recordings; con el id habría que
+   * pedirla de nuevo a un endpoint que hoy no existe. Es un objeto plano de
+   * strings y números, así que cumple lo que React Navigation espera de un
+   * parámetro serializable.
+   */
+  Transcription: { grabacion: UploadedRecording };
 };
 
 /** Atajos para tipar las props de cada pantalla: navigation + route ya resueltos. */

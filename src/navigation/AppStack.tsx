@@ -1,5 +1,5 @@
 /**
- * Stack autenticado: home y grabación.
+ * Stack autenticado: home, grabación y el resultado de la transcripción.
  *
  * Aquí sí dejamos el header nativo visible, porque es lo que da la flecha de
  * "atrás" y el gesto de swipe en RecordScreen sin escribir nada.
@@ -9,6 +9,7 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 
 import HomeScreen from '../screens/HomeScreen';
 import RecordScreen from '../screens/RecordScreen';
+import TranscriptionScreen from '../screens/TranscriptionScreen';
 import type { AppStackParamList } from './types';
 
 const Stack = createNativeStackNavigator<AppStackParamList>();
@@ -27,6 +28,11 @@ export default function AppStack() {
     >
       <Stack.Screen name="Home" component={HomeScreen} options={{ title: 'VoiceCoach' }} />
       <Stack.Screen name="Record" component={RecordScreen} options={{ title: 'Grabar voz' }} />
+      <Stack.Screen
+        name="Transcription"
+        component={TranscriptionScreen}
+        options={{ title: 'Transcripción' }}
+      />
     </Stack.Navigator>
   );
 }

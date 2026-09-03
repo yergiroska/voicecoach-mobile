@@ -70,14 +70,22 @@ export function getHealth(): Promise<unknown> {
  * sin que TypeScript se entere.
  */
 export type UploadedRecording = {
-  /** `<uid>_<timestamp>_<aleatorio>`; con esto se pedirán luego transcripción y análisis. */
+  /** `<uid>_<timestamp>_<aleatorio>`; con esto se pedirá luego el análisis. */
   recording_id: string;
+  /** La transcripción. Cadena vacía si el audio no traía voz: eso no es un error. */
+  text: string;
   /** Nombre con el que el backend guardó el archivo. */
-  filename: string;
+  filename: string | null;
   /** Tipo MIME normalizado, sin parámetros. */
-  content_type: string;
+  content_type: string | null;
   /** Tamaño real recibido, en bytes. */
-  size_bytes: number;
+  size_bytes: number | null;
+  /** Idioma detectado por Whisper (código ISO, p.ej. "es"). */
+  language: string | null;
+  /** Duración medida por Whisper; puede no cuadrar con la que midió el recorder. */
+  duration_seconds: number | null;
+  /** Modelo de Groq que produjo la transcripción. */
+  model: string | null;
 };
 
 /**
@@ -188,11 +196,70 @@ function mensajeDeError(status: number, detalle: string | null): string {
   }
 }
 
+/** Mensaje único para cualquier respuesta que no encaje con el schema. */
+const ERROR_RESPUESTA =
+  'El servidor respondió algo que la app no entiende. Vuelve a enviar la grabación.';
+
+/** Devuelve el campo si es un string, o null si falta o es de otro tipo. */
+function leerTexto(datos: Record<string, unknown>, campo: string): string | null {
+  const valor = datos[campo];
+  return typeof valor === 'string' ? valor : null;
+}
+
+/** Igual que leerTexto pero para números; descarta NaN e Infinity. */
+function leerNumero(datos: Record<string, unknown>, campo: string): number | null {
+  const valor = datos[campo];
+  return typeof valor === 'number' && Number.isFinite(valor) ? valor : null;
+}
+
+/**
+ * Comprueba el cuerpo de POST /recordings en vez de castearlo con `as`.
+ *
+ * Mientras la respuesta eran cuatro metadatos, el cast salía gratis: un campo
+ * ausente se habría visto como un `undefined` feo en una línea secundaria. Con
+ * la transcripción ya no, porque `text` es lo único que la pantalla de resultado
+ * enseña, y si llegara ausente el usuario vería una pantalla en blanco sin nada
+ * que le explique qué pasó.
+ *
+ * De ahí el reparto: se exige lo que sostiene el flujo (`recording_id` y `text`)
+ * y se acepta que falte todo lo demás. El resto son datos de apoyo que la interfaz
+ * puede omitir, así que exigirlos convertiría un cambio menor del backend en una
+ * subida rechazada teniendo la transcripción ya en la mano.
+ */
+function validarRespuesta(body: unknown): UploadedRecording {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(ERROR_RESPUESTA);
+  }
+
+  const datos = body as Record<string, unknown>;
+
+  const recording_id = leerTexto(datos, 'recording_id');
+  const text = leerTexto(datos, 'text');
+
+  // Se comprueba que `text` VENGA y sea string, no que tenga contenido: un audio
+  // en silencio devuelve "" legítimamente y la pantalla lo resuelve con un estado
+  // vacío. Rechazarlo aquí sería tratar una grabación válida como un fallo.
+  if (recording_id === null || text === null) {
+    throw new Error(ERROR_RESPUESTA);
+  }
+
+  return {
+    recording_id,
+    text,
+    filename: leerTexto(datos, 'filename'),
+    content_type: leerTexto(datos, 'content_type'),
+    size_bytes: leerNumero(datos, 'size_bytes'),
+    language: leerTexto(datos, 'language'),
+    duration_seconds: leerNumero(datos, 'duration_seconds'),
+    model: leerTexto(datos, 'model'),
+  };
+}
+
 /**
  * POST /recordings — sube al backend el audio grabado en el móvil.
  *
  * @param uri URI local (file://) que devuelve el recorder al detenerse.
- * @returns Los datos de la grabación guardada, incluido su `recording_id`.
+ * @returns La grabación guardada con su transcripción ya resuelta por el backend.
  * @throws Error con un mensaje ya presentable al usuario si algo falla.
  */
 export async function uploadRecording(uri: string): Promise<UploadedRecording> {
@@ -239,5 +306,5 @@ export async function uploadRecording(uri: string): Promise<UploadedRecording> {
     throw new Error(mensajeDeError(response.status, await extraerDetalle(response)));
   }
 
-  return (await response.json()) as UploadedRecording;
+  return validarRespuesta(await response.json());
 }

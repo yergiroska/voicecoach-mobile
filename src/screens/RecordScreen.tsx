@@ -33,6 +33,22 @@ function formatearTamano(bytes: number): string {
 }
 
 /**
+ * Tamaño y tipo tal y como los recibió el servidor, saltándose lo que no llegue.
+ *
+ * Los dos campos son opcionales desde que api.ts valida la respuesta en vez de
+ * castearla: solo `recording_id` y `text` se dan por seguros. Devuelve null si
+ * no queda nada que enseñar, y entonces la línea entera desaparece en vez de
+ * dejar un "0 B ·" a medias.
+ */
+function describirEnvio({ size_bytes, content_type }: UploadedRecording): string | null {
+  const partes = [size_bytes !== null ? formatearTamano(size_bytes) : null, content_type].filter(
+    (parte): parte is string => parte !== null
+  );
+
+  return partes.length > 0 ? partes.join(' · ') : null;
+}
+
+/**
  * Estado de la subida como unión discriminada: así el resultado y el mensaje de
  * error no pueden existir a la vez, ni quedar colgando de una subida anterior.
  */
@@ -59,6 +75,9 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
   const [subida, setSubida] = useState<EstadoSubida>({ estado: 'inactiva' });
 
   const subiendo = subida.estado === 'subiendo';
+  // Se calcula aquí y no en el JSX para no repetir la llamada entre la condición
+  // que decide si pintar la línea y el contenido de la línea misma.
+  const detalleEnvio = subida.estado === 'ok' ? describirEnvio(subida.grabacion) : null;
   // Durante la subida se bloquea la misma interfaz que durante una transición
   // del recorder: empezar a grabar de nuevo dejaría en vuelo una petición cuyo
   // resultado ya no correspondería a la grabación que se ve en pantalla.
@@ -88,6 +107,15 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
     try {
       const grabacion = await uploadRecording(recording.uri);
       setSubida({ estado: 'ok', grabacion });
+
+      // La transcripción viene dentro de la propia respuesta, así que el
+      // resultado se abre solo: no hay nada que el usuario tenga que pedir.
+      //
+      // Se apila con navigate en vez de sustituir la pantalla con replace para
+      // que la flecha de atrás devuelva al grabador y no a Home. Y si la
+      // validación de api.ts hubiera rechazado la respuesta, no llegaríamos
+      // hasta aquí: el catch de abajo pinta el error y no se navega a nada.
+      navigation.navigate('Transcription', { grabacion });
     } catch (error) {
       // uploadRecording ya lanza Error con mensajes pensados para enseñarse tal
       // cual; el fallback solo cubre que lo lanzado no sea un Error.
@@ -176,9 +204,8 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
           <Text style={styles.resultLine}>
             Duración: {formatearDuracion(recording.durationMillis)}
           </Text>
-          {/* La URI es un file:// en el caché de la app; se muestra solo para
-              verificar a mano que la grabación existe antes de conectar la
-              transcripción. */}
+          {/* La URI es un file:// en el caché de la app; se muestra para poder
+              comprobar a mano que la grabación existe. */}
           <Text style={styles.resultUri} numberOfLines={2}>
             {recording.uri}
           </Text>
@@ -188,14 +215,24 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
           {subida.estado === 'ok' ? (
             <View style={styles.success}>
               <Text style={styles.successTitle}>Enviada al servidor</Text>
-              <Text style={styles.successLine}>
-                {formatearTamano(subida.grabacion.size_bytes)} · {subida.grabacion.content_type}
-              </Text>
+              {detalleEnvio !== null && <Text style={styles.successLine}>{detalleEnvio}</Text>}
               {/* selectable para poder copiar el ID y buscar la grabación en el
                   backend mientras se prueba a mano. */}
               <Text style={styles.successId} selectable numberOfLines={2}>
                 {subida.grabacion.recording_id}
               </Text>
+
+              {/* Al subir ya se abrió la transcripción sola; esto es la reentrada
+                  para quien retrocedió hasta aquí y quiere releerla sin tener que
+                  grabar otra vez. */}
+              <Pressable
+                onPress={() =>
+                  navigation.navigate('Transcription', { grabacion: subida.grabacion })
+                }
+                hitSlop={8}
+              >
+                <Text style={[styles.link, styles.successLink]}>Ver transcripción</Text>
+              </Pressable>
             </View>
           ) : (
             <Pressable
@@ -362,6 +399,11 @@ const styles = StyleSheet.create({
   successId: {
     fontSize: 11,
     color: '#4d7c0f',
+  },
+  // El recuadro usa gap: 2 para apretar los datos; el enlace es una acción y
+  // necesita separarse de ellos.
+  successLink: {
+    marginTop: 6,
   },
   backButton: {
     backgroundColor: '#e4e4e7',
