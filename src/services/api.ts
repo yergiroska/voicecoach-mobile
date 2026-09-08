@@ -84,8 +84,72 @@ export type UploadedRecording = {
   language: string | null;
   /** Duración medida por Whisper; puede no cuadrar con la que midió el recorder. */
   duration_seconds: number | null;
-  /** Modelo de Groq que produjo la transcripción. */
+  /** Modelo de Groq que produjo la transcripción (Whisper). */
   model: string | null;
+  /**
+   * Análisis de la comunicación construido sobre `text`.
+   *
+   * Null cuando el análisis no se pudo hacer. Llega por un camino distinto al de
+   * la transcripción y falla por su cuenta: el backend responde 201 con el texto
+   * aunque el modelo de análisis no conteste. Dar por hecho este objeto es el
+   * error que el propio schema del servidor avisa de no cometer.
+   */
+  analysis: RecordingAnalysis | null;
+};
+
+/** Una muletilla detectada y las veces que aparece. */
+export type FillerWord = {
+  /** La muletilla, ya en minúsculas. */
+  word: string;
+  count: number;
+};
+
+/**
+ * Lo que se calcula en Python sobre el texto, sin pasar por el modelo.
+ *
+ * Son las que hacen que el análisis siga valiendo algo cuando el LLM falla: si
+ * los tres scores llegan a null, esto sigue teniendo contenido.
+ */
+export type SpeechMetrics = {
+  word_count: number | null;
+  /** Ritmo del habla. Null si Whisper no informó de la duración: no se estima. */
+  words_per_minute: number | null;
+  filler_count: number | null;
+  /** Desglose de más a menos frecuente. Mirar `fillers_analyzed` antes de leerlo. */
+  filler_words: FillerWord[];
+  /**
+   * Si la detección llegó a ejecutarse. Es false cuando el idioma no es
+   * español, porque la lista de muletillas es es-ES.
+   *
+   * CON false, `filler_count: 0` significa "no se miró", NO "no hay ninguna".
+   * Enseñar un cero en ese caso sería afirmar algo que nadie ha comprobado.
+   */
+  fillers_analyzed: boolean;
+};
+
+/**
+ * Los juicios del modelo, de 0 a 100.
+ *
+ * Null no es cero: cero es una valoración pésima y null es la ausencia de
+ * valoración. Confundirlos se vería en pantalla.
+ */
+export type CommunicationScores = {
+  clarity: number | null;
+  confidence: number | null;
+  pace: number | null;
+};
+
+/** El análisis completo, tal y como lo anida `analysis`. */
+export type RecordingAnalysis = {
+  metrics: SpeechMetrics;
+  scores: CommunicationScores;
+  /** Devolución en prosa, en el idioma de la grabación. */
+  summary: string | null;
+  suggestions: string[];
+  /** Modelo que hizo la valoración. OJO: no es el `model` de arriba, que es el de Whisper. */
+  model: string | null;
+  /** Versión del prompt, para distinguir dos análisis del mismo audio. */
+  prompt_version: string | null;
 };
 
 /**
@@ -212,6 +276,109 @@ function leerNumero(datos: Record<string, unknown>, campo: string): number | nul
   return typeof valor === 'number' && Number.isFinite(valor) ? valor : null;
 }
 
+/** El campo si es un objeto (no un array ni null); si no, null. */
+function leerObjeto(datos: Record<string, unknown>, campo: string): Record<string, unknown> | null {
+  const valor = datos[campo];
+  return typeof valor === 'object' && valor !== null && !Array.isArray(valor)
+    ? (valor as Record<string, unknown>)
+    : null;
+}
+
+/** El campo si es un booleano; si no, null (para poder distinguir "ausente"). */
+function leerBooleano(datos: Record<string, unknown>, campo: string): boolean | null {
+  const valor = datos[campo];
+  return typeof valor === 'boolean' ? valor : null;
+}
+
+/**
+ * Los strings de una lista, descartando lo que no lo sea.
+ *
+ * Devuelve [] y no null: para una lista, "vacía" y "ausente" se pintan igual, y
+ * así la pantalla itera sin comprobar nada antes.
+ */
+function leerListaDeTextos(datos: Record<string, unknown>, campo: string): string[] {
+  const valor = datos[campo];
+  return Array.isArray(valor) ? valor.filter((item): item is string => typeof item === 'string') : [];
+}
+
+/** Las muletillas bien formadas de la lista; una entrada rota no tira las demás. */
+function leerMuletillas(datos: Record<string, unknown>, campo: string): FillerWord[] {
+  const valor = datos[campo];
+  if (!Array.isArray(valor)) {
+    return [];
+  }
+
+  const muletillas: FillerWord[] = [];
+  for (const item of valor) {
+    if (typeof item !== 'object' || item === null) {
+      continue;
+    }
+    const entrada = item as Record<string, unknown>;
+    const word = leerTexto(entrada, 'word');
+    const count = leerNumero(entrada, 'count');
+    if (word !== null && count !== null) {
+      muletillas.push({ word, count });
+    }
+  }
+
+  return muletillas;
+}
+
+/** Las métricas deterministas. Recibe null si `metrics` no venía. */
+function validarMetricas(datos: Record<string, unknown> | null): SpeechMetrics {
+  const campos = datos ?? {};
+
+  return {
+    word_count: leerNumero(campos, 'word_count'),
+    words_per_minute: leerNumero(campos, 'words_per_minute'),
+    filler_count: leerNumero(campos, 'filler_count'),
+    filler_words: leerMuletillas(campos, 'filler_words'),
+    // Ausente cuenta como false, que es el default seguro: si no consta que las
+    // muletillas se analizaran, la pantalla no debe enseñar ningún conteo.
+    // Equivocarse hacia true produciría el "0 muletillas, ¡perfecto!" sobre un
+    // audio que nadie miró.
+    fillers_analyzed: leerBooleano(campos, 'fillers_analyzed') ?? false,
+  };
+}
+
+/** Los tres scores. Recibe null si `scores` no venía. */
+function validarScores(datos: Record<string, unknown> | null): CommunicationScores {
+  const campos = datos ?? {};
+
+  return {
+    clarity: leerNumero(campos, 'clarity'),
+    confidence: leerNumero(campos, 'confidence'),
+    pace: leerNumero(campos, 'pace'),
+  };
+}
+
+/**
+ * El análisis, o null si no vino uno aprovechable. NO lanza nunca.
+ *
+ * Esa es la diferencia con validarRespuesta: un análisis roto no puede tumbar
+ * una subida cuya transcripción llegó bien, que es lo caro de recuperar. Se
+ * degrada a null y la pantalla lo dice sin alarmar.
+ *
+ * `metrics` y `scores` se devuelven siempre como objeto, aunque no vinieran, para
+ * que quien los consuma mire un solo nivel de nulidad (cada campo) en vez de dos.
+ */
+function validarAnalisis(valor: unknown): RecordingAnalysis | null {
+  if (typeof valor !== 'object' || valor === null || Array.isArray(valor)) {
+    return null;
+  }
+
+  const datos = valor as Record<string, unknown>;
+
+  return {
+    metrics: validarMetricas(leerObjeto(datos, 'metrics')),
+    scores: validarScores(leerObjeto(datos, 'scores')),
+    summary: leerTexto(datos, 'summary'),
+    suggestions: leerListaDeTextos(datos, 'suggestions'),
+    model: leerTexto(datos, 'model'),
+    prompt_version: leerTexto(datos, 'prompt_version'),
+  };
+}
+
 /**
  * Comprueba el cuerpo de POST /recordings en vez de castearlo con `as`.
  *
@@ -252,6 +419,7 @@ function validarRespuesta(body: unknown): UploadedRecording {
     language: leerTexto(datos, 'language'),
     duration_seconds: leerNumero(datos, 'duration_seconds'),
     model: leerTexto(datos, 'model'),
+    analysis: validarAnalisis(datos.analysis),
   };
 }
 

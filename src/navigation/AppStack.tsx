@@ -1,5 +1,5 @@
 /**
- * Stack autenticado: home, grabación y el resultado de la transcripción.
+ * Stack autenticado: home, grabación y el resultado (análisis y transcripción).
  *
  * Aquí sí dejamos el header nativo visible, porque es lo que da la flecha de
  * "atrás" y el gesto de swipe en RecordScreen sin escribir nada.
@@ -31,7 +31,7 @@ export default function AppStack() {
       <Stack.Screen
         name="Transcription"
         component={TranscriptionScreen}
-        options={{ title: 'Transcripción' }}
+        options={{ title: 'Resultado' }}
       />
     </Stack.Navigator>
   );
