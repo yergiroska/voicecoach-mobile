@@ -1,7 +1,7 @@
 /**
  * PANTALLA TEMPORAL — el "hub" del flujo autenticado mientras la app real no
  * existe. Recoge lo que antes hacía App.tsx (mostrar el correo y cerrar sesión)
- * y añade la entrada a la grabación.
+ * y añade las entradas a la grabación y al progreso.
  */
 
 import { useState } from 'react';
@@ -46,6 +46,15 @@ export default function HomeScreen({ navigation }: AppStackScreenProps<'Home'>) 
         onPress={() => navigation.navigate('Record')}
       >
         <Text style={styles.buttonText}>Grabar voz</Text>
+      </Pressable>
+
+      {/* Secundario y no primario: grabar es lo que se viene a hacer aquí, y
+          consultar el progreso es la visita ocasional. */}
+      <Pressable
+        style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]}
+        onPress={() => navigation.navigate('Progress')}
+      >
+        <Text style={styles.secondaryButtonText}>Mi progreso</Text>
       </Pressable>
 
       <Pressable

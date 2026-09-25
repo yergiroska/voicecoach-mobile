@@ -32,6 +32,15 @@ export type AppStackParamList = {
    * parámetro serializable.
    */
   Transcription: { grabacion: UploadedRecording };
+  /**
+   * Evolución del usuario frente a su línea base.
+   *
+   * Sin parámetros, al revés que Transcription: esta pantalla no recibe nada
+   * hecho, pide sus propios datos al montarse. Lo que compara son ventanas de
+   * sesiones, no la grabación desde la que se llegue aquí, así que no hay nada
+   * que pasarle.
+   */
+  Progress: undefined;
 };
 
 /** Atajos para tipar las props de cada pantalla: navigation + route ya resueltos. */

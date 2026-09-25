@@ -153,6 +153,116 @@ export type RecordingAnalysis = {
 };
 
 /**
+ * GET /me/baseline: la línea base del usuario y cómo evolucionan sus sesiones
+ * recientes frente a ella. Nombres en snake_case, como el resto del módulo.
+ *
+ * Las dos familias de datos se exponen DISTINTO a propósito, y el cliente tiene
+ * que respetarlo: las métricas deterministas llevan cifras porque son
+ * aritmética exacta sobre el texto, y los scores del modelo solo una tendencia
+ * en palabras porque tienen un ruido medido de unos ±5 puntos entre pasadas.
+ * Enseñar "has pasado de 65 a 60" sería reportarle ruido al usuario como si
+ * fuera progreso suyo.
+ */
+export type BaselineStatus = 'collecting' | 'ready';
+
+/** Tasa de muletillas. Menos es mejor, así que aquí sí hay una buena dirección. */
+export type FillerTrend = 'improving' | 'stable' | 'worsening' | 'insufficient_data';
+
+/**
+ * Ritmo medido. NO tiene "mejor" ni "peor", y no es un descuido.
+ *
+ * Acelerar no es progresar: el ritmo tiene un rango adecuado y se puede uno
+ * salir por arriba o por abajo. Si esto dijera "improving" al subir, la interfaz
+ * acabaría animando a atropellarse.
+ */
+export type PaceTrend = 'faster' | 'stable' | 'slower' | 'insufficient_data';
+
+/**
+ * Tendencia de un score del modelo.
+ *
+ * Cinco tramos y no tres: con la zona muerta ancha que obliga a dejar el ruido
+ * del modelo, distinguir "better" de "much_better" es lo que permite separar una
+ * mejora dudosa de una evidente sin enseñar ningún número.
+ */
+export type ScoreTrend =
+  | 'much_better'
+  | 'better'
+  | 'similar'
+  | 'worse'
+  | 'much_worse'
+  | 'insufficient_data';
+
+/**
+ * Cuántas sesiones aportaron un valor a cada ventana.
+ *
+ * Vienen siempre porque una media no significa nada sin su tamaño de muestra, y
+ * porque cada métrica puede tener el suyo: una sesión sin duración de audio no
+ * tiene palabras por minuto pero sí muletillas.
+ */
+export type WindowSamples = {
+  baseline_samples: number | null;
+  recent_samples: number | null;
+};
+
+export type NumericComparison = WindowSamples & {
+  /** Media de la línea base: las primeras sesiones válidas. */
+  baseline: number | null;
+  /** Media de las sesiones recientes, siempre posteriores a la línea base. */
+  recent: number | null;
+  /** `recent - baseline`. El signo solo no dice si es bueno o malo: para eso está `trend`. */
+  delta: number | null;
+};
+
+export type FillerRateComparison = NumericComparison & { trend: FillerTrend };
+
+export type WordsPerMinuteComparison = NumericComparison & { trend: PaceTrend };
+
+export type DeterministicMetrics = {
+  /** Muletillas por cada 100 palabras: una tasa, no un conteo, para que las sesiones largas no salgan peor por serlo. */
+  filler_rate: FillerRateComparison;
+  words_per_minute: WordsPerMinuteComparison;
+};
+
+/** Tendencia de un score, sin cifras. Ver el comentario de BaselineStatus. */
+export type ScoreComparison = WindowSamples & { trend: ScoreTrend };
+
+/**
+ * Los scores del modelo, con su PROPIA ventana y su propio estado.
+ *
+ * Solo cuentan los análisis hechos con el prompt y el modelo actuales, porque
+ * dos scores de versiones distintas no son comparables. La consecuencia es que
+ * al cambiar cualquiera de los dos esta sección vuelve a `collecting` mientras
+ * las métricas siguen listas: la pantalla tiene que poder enseñar las dos cosas
+ * a la vez.
+ */
+export type ScoresBaseline = {
+  status: BaselineStatus;
+  prompt_version: string | null;
+  analysis_model: string | null;
+  valid_sessions: number | null;
+  sessions_needed: number | null;
+  clarity: ScoreComparison | null;
+  confidence: ScoreComparison | null;
+  /** Adecuación del ritmo SEGÚN EL MODELO. No confundir con `metrics.words_per_minute`, que es la medida objetiva. */
+  pace: ScoreComparison | null;
+};
+
+export type Baseline = {
+  /** Gobierna `metrics`. Los scores tienen el suyo en `scores.status`. */
+  status: BaselineStatus;
+  /** Sesiones válidas que forman la línea base: las primeras N. */
+  baseline_size: number | null;
+  recent_window: number | null;
+  valid_sessions: number | null;
+  /** Sesiones que NO cuentan: silencio, muy cortas, u otro idioma. Sirve para explicar por qué una grabación no hizo avanzar el progreso. */
+  excluded_sessions: number | null;
+  sessions_needed: number | null;
+  /** Null mientras `status` sea `collecting`. */
+  metrics: DeterministicMetrics | null;
+  scores: ScoresBaseline;
+};
+
+/**
  * El backend elige la extensión con la que guarda a partir del content-type de
  * la parte multipart, no del nombre del archivo, así que este mapeo es lo que
  * de verdad decide si acepta o rechaza el audio.
@@ -238,8 +348,18 @@ async function extraerDetalle(response: Response): Promise<string | null> {
   }
 }
 
-/** Traduce el status a algo que se pueda enseñar tal cual en la pantalla. */
-function mensajeDeError(status: number, detalle: string | null): string {
+/**
+ * Traduce el status a algo que se pueda enseñar tal cual en la pantalla.
+ *
+ * `accion` solo entra en el caso por defecto, que es el único mensaje que nombra
+ * la operación. Con el valor por defecto, quien ya llamaba a esta función sigue
+ * obteniendo exactamente el mismo texto.
+ */
+function mensajeDeError(
+  status: number,
+  detalle: string | null,
+  accion = 'al subir la grabación'
+): string {
   switch (status) {
     case 401:
       // El detail del backend aquí es técnico ("token inválido o expirado"); al
@@ -256,8 +376,57 @@ function mensajeDeError(status: number, detalle: string | null): string {
         detalle ?? 'El servidor no puede validar sesiones ahora mismo. Inténtalo en un momento.'
       );
     default:
-      return detalle ?? `El servidor respondió ${status} al subir la grabación.`;
+      return detalle ?? `El servidor respondió ${status} ${accion}.`;
   }
+}
+
+/**
+ * GET autenticado contra el backend.
+ *
+ * Reúne las cuatro cosas que hasta ahora solo existían dentro de
+ * uploadRecording: el token de Firebase, el timeout manual, la extracción del
+ * `detail` de FastAPI y su traducción a un mensaje enseñable. Sin esto, cada
+ * endpoint nuevo volvería a copiarlas.
+ *
+ * No sustituye a request(): ese sirve a /health, que es público y cuyo error
+ * crudo no llega a ninguna pantalla.
+ *
+ * Devuelve `unknown` a propósito. Validar el cuerpo es de quien sabe qué forma
+ * espera, no de la capa de transporte.
+ */
+async function requestAutenticado(path: string): Promise<unknown> {
+  const baseUrl = requireApiUrl();
+  const token = await obtenerToken();
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(
+        `Timeout tras ${TIMEOUT_MS / 1000}s al llamar a ${baseUrl}${path}. ` +
+          '¿El backend sigue corriendo y el móvil está en la misma red?'
+      );
+    }
+    const causa = error instanceof Error ? error.message : String(error);
+    throw new Error(`No se pudo conectar con el servidor (${causa}).`);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      mensajeDeError(response.status, await extraerDetalle(response), 'al consultar el servidor')
+    );
+  }
+
+  return await response.json();
 }
 
 /** Mensaje único para cualquier respuesta que no encaje con el schema. */
@@ -268,6 +437,26 @@ const ERROR_RESPUESTA =
 function leerTexto(datos: Record<string, unknown>, campo: string): string | null {
   const valor = datos[campo];
   return typeof valor === 'string' ? valor : null;
+}
+
+/**
+ * Un valor de una lista cerrada, o `porDefecto` si no es ninguno de ellos.
+ *
+ * El default no es un detalle: si el backend añade mañana una tendencia que esta
+ * versión del cliente no conoce, caer en "insufficient_data" dice "todavía no se
+ * sabe", que desde aquí es literalmente cierto. Adivinar "stable" sería afirmar
+ * que no ha cambiado nada, que es una afirmación que nadie ha medido.
+ */
+function leerOpcion<T extends string>(
+  datos: Record<string, unknown>,
+  campo: string,
+  permitidas: readonly T[],
+  porDefecto: T
+): T {
+  const valor = datos[campo];
+  return typeof valor === 'string' && (permitidas as readonly string[]).includes(valor)
+    ? (valor as T)
+    : porDefecto;
 }
 
 /** Igual que leerTexto pero para números; descarta NaN e Infinity. */
@@ -475,4 +664,149 @@ export async function uploadRecording(uri: string): Promise<UploadedRecording> {
   }
 
   return validarRespuesta(await response.json());
+}
+/** Mensaje para una respuesta de /me/baseline que no se puede interpretar. */
+const ERROR_BASELINE =
+  'El servidor respondió algo que la app no entiende al pedir tu progreso.';
+
+const ESTADOS: readonly BaselineStatus[] = ['collecting', 'ready'];
+
+const TENDENCIAS_MULETILLAS: readonly FillerTrend[] = [
+  'improving',
+  'stable',
+  'worsening',
+  'insufficient_data',
+];
+
+const TENDENCIAS_RITMO: readonly PaceTrend[] = [
+  'faster',
+  'stable',
+  'slower',
+  'insufficient_data',
+];
+
+const TENDENCIAS_SCORE: readonly ScoreTrend[] = [
+  'much_better',
+  'better',
+  'similar',
+  'worse',
+  'much_worse',
+  'insufficient_data',
+];
+
+/** Una comparación con cifras. Recibe null si el objeto no venía. */
+function validarComparacion<T extends string>(
+  datos: Record<string, unknown> | null,
+  permitidas: readonly T[],
+  porDefecto: T
+): NumericComparison & { trend: T } {
+  const campos = datos ?? {};
+
+  return {
+    baseline: leerNumero(campos, 'baseline'),
+    recent: leerNumero(campos, 'recent'),
+    delta: leerNumero(campos, 'delta'),
+    baseline_samples: leerNumero(campos, 'baseline_samples'),
+    recent_samples: leerNumero(campos, 'recent_samples'),
+    trend: leerOpcion(campos, 'trend', permitidas, porDefecto),
+  };
+}
+
+/** Null cuando `metrics` no vino, que es lo normal en `collecting`. */
+function validarMetricasBaseline(
+  datos: Record<string, unknown> | null
+): DeterministicMetrics | null {
+  if (datos === null) {
+    return null;
+  }
+
+  return {
+    filler_rate: validarComparacion(
+      leerObjeto(datos, 'filler_rate'),
+      TENDENCIAS_MULETILLAS,
+      'insufficient_data'
+    ),
+    words_per_minute: validarComparacion(
+      leerObjeto(datos, 'words_per_minute'),
+      TENDENCIAS_RITMO,
+      'insufficient_data'
+    ),
+  };
+}
+
+/** Null cuando el score no vino, que es lo normal mientras `scores.status` es `collecting`. */
+function validarScoreComparison(
+  datos: Record<string, unknown> | null
+): ScoreComparison | null {
+  if (datos === null) {
+    return null;
+  }
+
+  return {
+    trend: leerOpcion(datos, 'trend', TENDENCIAS_SCORE, 'insufficient_data'),
+    baseline_samples: leerNumero(datos, 'baseline_samples'),
+    recent_samples: leerNumero(datos, 'recent_samples'),
+  };
+}
+
+/**
+ * La sección de scores, siempre como objeto.
+ *
+ * Aunque no viniera se devuelve una con `status: 'collecting'`, para que la
+ * pantalla mire un solo nivel de nulidad en vez de dos.
+ */
+function validarScoresBaseline(datos: Record<string, unknown> | null): ScoresBaseline {
+  const campos = datos ?? {};
+
+  return {
+    status: leerOpcion(campos, 'status', ESTADOS, 'collecting'),
+    prompt_version: leerTexto(campos, 'prompt_version'),
+    analysis_model: leerTexto(campos, 'analysis_model'),
+    valid_sessions: leerNumero(campos, 'valid_sessions'),
+    sessions_needed: leerNumero(campos, 'sessions_needed'),
+    clarity: validarScoreComparison(leerObjeto(campos, 'clarity')),
+    confidence: validarScoreComparison(leerObjeto(campos, 'confidence')),
+    pace: validarScoreComparison(leerObjeto(campos, 'pace')),
+  };
+}
+
+/**
+ * Comprueba el cuerpo de GET /me/baseline.
+ *
+ * Al contrario que validarAnalisis, este SÍ lanza cuando el cuerpo no es un
+ * objeto, y la diferencia es de fondo: el análisis viaja de acompañante de una
+ * transcripción que vale por sí sola, mientras que aquí el baseline es toda la
+ * carga útil. Si no se entiende, no queda nada que enseñar, y decirlo es mejor
+ * que pintar una pantalla de progreso vacía.
+ *
+ * A partir de ahí degrada: `status` desconocido cae en `collecting`, que es el
+ * conservador, porque con `collecting` no se enseña ninguna comparación. Preferir
+ * eso a mostrar cifras de las que no sabemos si son válidas.
+ */
+function validarBaseline(body: unknown): Baseline {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new Error(ERROR_BASELINE);
+  }
+
+  const datos = body as Record<string, unknown>;
+
+  return {
+    status: leerOpcion(datos, 'status', ESTADOS, 'collecting'),
+    baseline_size: leerNumero(datos, 'baseline_size'),
+    recent_window: leerNumero(datos, 'recent_window'),
+    valid_sessions: leerNumero(datos, 'valid_sessions'),
+    excluded_sessions: leerNumero(datos, 'excluded_sessions'),
+    sessions_needed: leerNumero(datos, 'sessions_needed'),
+    metrics: validarMetricasBaseline(leerObjeto(datos, 'metrics')),
+    scores: validarScoresBaseline(leerObjeto(datos, 'scores')),
+  };
+}
+
+/**
+ * GET /me/baseline — la línea base del usuario y su evolución reciente.
+ *
+ * @throws Error con un mensaje ya presentable al usuario si algo falla.
+ */
+export async function getBaseline(): Promise<Baseline> {
+  return validarBaseline(await requestAutenticado('/me/baseline'));
 }
