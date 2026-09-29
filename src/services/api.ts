@@ -263,6 +263,72 @@ export type Baseline = {
 };
 
 /**
+ * GET /me/history: el histórico sesión a sesión, que es lo que dibujan las
+ * gráficas. Un punto por grabación, de la más antigua a la más nueva — ya vienen
+ * en orden de dibujo, así que aquí no se ordena nada.
+ *
+ * Solo métricas DETERMINISTAS. Los scores del modelo no están y no es un olvido:
+ * dibujados sesión a sesión, su ruido de unos ±5 puntos entre pasadas se leería
+ * como una tendencia real. Su evolución va agregada y en palabras, en
+ * /me/baseline.
+ */
+export type ExcludedReason = 'not_analyzed' | 'too_short' | 'other_language';
+
+export type HistorySession = {
+  recording_id: string;
+  /**
+   * Cuándo se grabó, en ISO 8601 con zona. Es el eje X.
+   *
+   * Se queda como string: convertirlo a Date aquí sería justo la capa de mapeo
+   * que este módulo evita, y quien decide cómo se lee una fecha es la pantalla.
+   */
+  recorded_at: string;
+  /** Si la sesión cuenta para las gráficas y para la línea base. */
+  valid: boolean;
+  /** Por qué no cuenta. Null si y solo si `valid` es true. */
+  excluded_reason: ExcludedReason | null;
+  /** Muletillas por cada 100 palabras. Null en las inválidas. */
+  filler_rate: number | null;
+  /**
+   * Ritmo del habla. Null en las inválidas Y TAMBIÉN en una sesión válida cuyo
+   * audio no trajo duración: esa sigue contando para las muletillas y solo le
+   * falta este punto.
+   *
+   * De ahí que las dos gráficas tengan huecos en sitios distintos, que es la
+   * razón de fondo por la que no pueden compartir lienzo.
+   */
+  words_per_minute: number | null;
+  /**
+   * Palabras de la transcripción. Ayuda a leer `filler_rate`: un 20 % sobre 15
+   * palabras pesa menos que sobre 120. Viene también en las inválidas ("1
+   * palabra" explica un too_short) y es null solo en `not_analyzed`, donde no
+   * hay análisis del que sacarla.
+   */
+  word_count: number | null;
+  /**
+   * Si es una de las primeras sesiones válidas que forman la línea base.
+   *
+   * Son las de TODA la historia, no solo las de esta página: con pocas sesiones
+   * por página es normal que no venga ninguna marcada.
+   */
+  in_baseline: boolean;
+};
+
+export type History = {
+  /** Todas las grabaciones del usuario, válidas o no, en toda su historia. */
+  total_sessions: number | null;
+  /** Las que cuentan, también en toda la historia y no solo en esta página. */
+  valid_sessions: number | null;
+  baseline_size: number | null;
+  /** El máximo pedido, que el backend devuelve de vuelta. */
+  limit: number | null;
+  /** Si hay sesiones más antiguas que no caben en esta página. */
+  has_more: boolean;
+  /** Vacía si el usuario todavía no ha grabado nada. */
+  sessions: HistorySession[];
+};
+
+/**
  * El backend elige la extensión con la que guarda a partir del content-type de
  * la parte multipart, no del nombre del archivo, así que este mapeo es lo que
  * de verdad decide si acepta o rechaza el audio.
@@ -809,4 +875,115 @@ function validarBaseline(body: unknown): Baseline {
  */
 export async function getBaseline(): Promise<Baseline> {
   return validarBaseline(await requestAutenticado('/me/baseline'));
+}
+/** Mensaje para una respuesta de /me/history que no se puede interpretar. */
+const ERROR_HISTORIAL =
+  'El servidor respondió algo que la app no entiende al pedir tu historial.';
+
+const MOTIVOS_EXCLUSION: readonly ExcludedReason[] = [
+  'not_analyzed',
+  'too_short',
+  'other_language',
+];
+
+/** El motivo si es uno de los conocidos; null si no vino o no lo reconocemos. */
+function leerMotivoExclusion(datos: Record<string, unknown>): ExcludedReason | null {
+  const valor = datos.excluded_reason;
+  return typeof valor === 'string' &&
+    (MOTIVOS_EXCLUSION as readonly string[]).includes(valor)
+    ? (valor as ExcludedReason)
+    : null;
+}
+
+/**
+ * Una sesión, o null si le falta lo mínimo para ser un punto de la gráfica.
+ *
+ * Se exigen `recording_id` y `recorded_at` porque sin identidad ni fecha no hay
+ * nada que situar en el eje. Todo lo demás degrada: una sesión sin métricas no
+ * es un error, es un hueco legítimo en la línea.
+ */
+function validarSesion(valor: unknown): HistorySession | null {
+  if (typeof valor !== 'object' || valor === null || Array.isArray(valor)) {
+    return null;
+  }
+
+  const datos = valor as Record<string, unknown>;
+
+  const recording_id = leerTexto(datos, 'recording_id');
+  const recorded_at = leerTexto(datos, 'recorded_at');
+
+  if (recording_id === null || recorded_at === null) {
+    return null;
+  }
+
+  const excluded_reason = leerMotivoExclusion(datos);
+
+  return {
+    recording_id,
+    recorded_at,
+    // Si `valid` no viene no se adivina con un default plano: se deriva del
+    // invariante que el propio backend declara y verifica ("excluded_reason es
+    // null si y solo si la sesión es válida"). Un default fijo fallaría en las
+    // dos direcciones — true escondería exclusiones reales y false inventaría
+    // sesiones fallidas que no existen.
+    valid: leerBooleano(datos, 'valid') ?? excluded_reason === null,
+    excluded_reason,
+    filler_rate: leerNumero(datos, 'filler_rate'),
+    words_per_minute: leerNumero(datos, 'words_per_minute'),
+    word_count: leerNumero(datos, 'word_count'),
+    // Ausente cuenta como false: no marcar ninguna sesión como línea base es
+    // preferible a sombrear un tramo que quizá no lo sea.
+    in_baseline: leerBooleano(datos, 'in_baseline') ?? false,
+  };
+}
+
+/**
+ * Comprueba el cuerpo de GET /me/history.
+ *
+ * Lanza si no es un objeto, igual que validarBaseline y por el mismo motivo: el
+ * historial es toda la carga útil de esta petición, así que si no se entiende no
+ * queda nada que dibujar.
+ *
+ * A partir de ahí degrada, y una sesión malformada se descarta sola sin tirar
+ * las demás: es la misma regla que sigue leerMuletillas. Perder un punto de
+ * treinta es mucho mejor que perder la gráfica entera.
+ */
+function validarHistorial(body: unknown): History {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new Error(ERROR_HISTORIAL);
+  }
+
+  const datos = body as Record<string, unknown>;
+  const crudas = Array.isArray(datos.sessions) ? datos.sessions : [];
+
+  const sessions: HistorySession[] = [];
+  for (const cruda of crudas) {
+    const sesion = validarSesion(cruda);
+    if (sesion !== null) {
+      sessions.push(sesion);
+    }
+  }
+
+  return {
+    total_sessions: leerNumero(datos, 'total_sessions'),
+    valid_sessions: leerNumero(datos, 'valid_sessions'),
+    baseline_size: leerNumero(datos, 'baseline_size'),
+    limit: leerNumero(datos, 'limit'),
+    // Ausente cuenta como false: no dar a entender que hay más sesiones de las
+    // que se están enseñando.
+    has_more: leerBooleano(datos, 'has_more') ?? false,
+    sessions,
+  };
+}
+
+/** Sesiones que se piden por defecto. El backend admite hasta 100. */
+const SESIONES_POR_DEFECTO = 30;
+
+/**
+ * GET /me/history — las sesiones más recientes, una por punto de gráfica.
+ *
+ * @throws Error con un mensaje ya presentable al usuario si algo falla.
+ */
+export async function getHistory(limit: number = SESIONES_POR_DEFECTO): Promise<History> {
+  return validarHistorial(await requestAutenticado(`/me/history?limit=${limit}`));
 }

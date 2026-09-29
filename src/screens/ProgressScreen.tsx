@@ -18,10 +18,15 @@ import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import ComparisonRow, { type Tono } from '../components/ComparisonRow';
+import MetricChart, { type PuntoGrafica } from '../components/MetricChart';
 import {
   getBaseline,
+  getHistory,
   type Baseline,
+  type ExcludedReason,
   type FillerTrend,
+  type History,
+  type HistorySession,
   type NumericComparison,
   type PaceTrend,
   type ScoreTrend,
@@ -159,6 +164,146 @@ function describirExcluidas(excluidas: number | null): string | null {
   return `${cuantas}: fueron muy cortas, en silencio o en otro idioma.`;
 }
 
+/**
+ * La fecha de una sesión, corta, para la etiqueta del eje X.
+ *
+ * Se compone a mano en vez de con toLocaleDateString porque el soporte de Intl
+ * en Hermes no es igual en las dos plataformas, y "14/3" se entiende en todas.
+ * Si el string no es una fecha válida se devuelve vacío: una etiqueta ausente
+ * estorba menos que un "Invalid Date".
+ */
+function formatearFecha(iso: string): string {
+  const fecha = new Date(iso);
+
+  if (Number.isNaN(fecha.getTime())) {
+    return '';
+  }
+  return `${fecha.getDate()}/${fecha.getMonth() + 1}`;
+}
+
+/**
+ * Una sola fecha por grupo de sesiones del mismo día, puesta en el punto
+ * central del grupo. El resto de posiciones van sin etiqueta.
+ *
+ * El eje dibuja cada etiqueta bajo SU punto, y la librería descarta los textos
+ * repetidos quedándose con el primero. Sin esto, con diez sesiones del mismo día
+ * la fecha caía bajo la primera de las diez, y las dos fechas del eje acababan
+ * amontonadas a la izquierda sin relación con dónde estaban los puntos.
+ *
+ * Decidiendo aquí qué punto lleva texto, cada fecha queda centrada bajo su
+ * grupo. La cadena vacía no pinta nada: el punto se dibuja igual.
+ */
+function etiquetarGrupos(sesiones: HistorySession[]): string[] {
+  const fechas = sesiones.map((sesion) => formatearFecha(sesion.recorded_at));
+  const etiquetas = fechas.map(() => '');
+
+  let inicio = 0;
+  for (let i = 1; i <= fechas.length; i += 1) {
+    // Cierra el grupo al cambiar de fecha, y también al llegar al final.
+    if (i === fechas.length || fechas[i] !== fechas[inicio]) {
+      etiquetas[Math.floor((inicio + i - 1) / 2)] = fechas[inicio] ?? '';
+      inicio = i;
+    }
+  }
+
+  return etiquetas;
+}
+
+/**
+ * Los puntos de una gráfica.
+ *
+ * No se filtran las sesiones sin dato: entran con `valor: null` para que la
+ * gráfica deje el hueco. Quitarlas juntaría dos sesiones no consecutivas y
+ * dibujaría una pendiente que nadie midió. Tampoco se ordenan: el backend ya
+ * las manda de la más antigua a la más nueva.
+ */
+function construirPuntos(
+  sesiones: HistorySession[],
+  metrica: 'filler_rate' | 'words_per_minute'
+): PuntoGrafica[] {
+  const etiquetas = etiquetarGrupos(sesiones);
+
+  return sesiones.map((sesion, indice) => ({
+    // El recording_id y no la fecha: ver el comentario de PuntoGrafica.clave.
+    // Dos sesiones del mismo día comparten fecha pero no posición.
+    clave: sesion.recording_id,
+    etiqueta: etiquetas[indice] ?? '',
+    valor: sesion[metrica],
+    enLineaBase: sesion.in_baseline,
+  }));
+}
+
+/** La línea de referencia, solo si la línea base ya está fijada. */
+function construirReferencia(
+  valor: number | null | undefined
+): { valor: number; etiqueta: string } | undefined {
+  return valor === null || valor === undefined
+    ? undefined
+    : { valor, etiqueta: 'Tu línea base' };
+}
+
+const NOMBRE_EXCLUSION: Record<ExcludedReason, string> = {
+  too_short: 'muy cortas',
+  other_language: 'en otro idioma',
+  not_analyzed: 'sin analizar',
+};
+
+/** Orden fijo para que la frase no cambie de forma entre dos cargas iguales. */
+const ORDEN_EXCLUSION: readonly ExcludedReason[] = [
+  'too_short',
+  'other_language',
+  'not_analyzed',
+];
+
+/**
+ * "3 de 30 sesiones no cuentan: 2 muy cortas · 1 en otro idioma."
+ *
+ * Aquí se desglosa por motivo, al contrario que en el bloque de la línea base,
+ * porque este endpoint sí lo trae sesión a sesión. Y el motivo importa: una
+ * grabación muy corta se arregla hablando más, y una en otro idioma no se
+ * arregla en absoluto.
+ */
+function describirExclusionesDelHistorial(sesiones: HistorySession[]): string | null {
+  const invalidas = sesiones.filter((sesion) => !sesion.valid);
+
+  if (invalidas.length === 0) {
+    return null;
+  }
+
+  const conteo: Record<ExcludedReason, number> = {
+    too_short: 0,
+    other_language: 0,
+    not_analyzed: 0,
+  };
+  let sinMotivo = 0;
+
+  for (const { excluded_reason } of invalidas) {
+    if (excluded_reason === null) {
+      sinMotivo += 1;
+    } else {
+      conteo[excluded_reason] += 1;
+    }
+  }
+
+  const partes = ORDEN_EXCLUSION.filter((motivo) => conteo[motivo] > 0).map(
+    (motivo) => `${conteo[motivo]} ${NOMBRE_EXCLUSION[motivo]}`
+  );
+  if (sinMotivo > 0) {
+    partes.push(`${sinMotivo} sin motivo conocido`);
+  }
+
+  const cabecera = `${invalidas.length} de ${sesiones.length} sesiones no cuentan`;
+  return partes.length > 0 ? `${cabecera}: ${partes.join(' · ')}.` : `${cabecera}.`;
+}
+
+/** "Mostrando las últimas 30 de 47 sesiones." Null si no hay más que enseñar. */
+function describirAlcance(historial: History): string | null {
+  if (!historial.has_more || historial.total_sessions === null) {
+    return null;
+  }
+  return `Mostrando las últimas ${historial.sessions.length} de ${historial.total_sessions} sesiones.`;
+}
+
 type EstadoCarga =
   | { estado: 'cargando' }
   | { estado: 'ok'; baseline: Baseline }
@@ -183,12 +328,32 @@ async function pedirBaseline(): Promise<EstadoCarga> {
   }
 }
 
+type EstadoHistorial =
+  | { estado: 'cargando' }
+  | { estado: 'ok'; historial: History }
+  | { estado: 'error'; mensaje: string };
+
+/** Igual que pedirBaseline: envuelve el fallo en el estado y no lanza. */
+async function pedirHistorial(): Promise<EstadoHistorial> {
+  try {
+    return { estado: 'ok', historial: await getHistory() };
+  } catch (error) {
+    return {
+      estado: 'error',
+      mensaje: error instanceof Error ? error.message : 'No se pudo cargar tu historial.',
+    };
+  }
+}
+
 export default function ProgressScreen({ navigation }: AppStackScreenProps<'Progress'>) {
   const [carga, setCarga] = useState<EstadoCarga>({ estado: 'cargando' });
   // Separado del estado: al actualizar, la pantalla NO vuelve a 'cargando'. Si
   // lo hiciera, el contenido desaparecería y volvería a aparecer, que es peor
   // que verlo quieto un segundo mientras el spinner gira en el botón.
   const [refrescando, setRefrescando] = useState(false);
+  // Su propio estado, no uno compartido: si el historial falla, las
+  // comparaciones de arriba siguen en pantalla.
+  const [historial, setHistorial] = useState<EstadoHistorial>({ estado: 'cargando' });
 
   // La petición sigue viva aunque el usuario se vaya de la pantalla; sin esta
   // comprobación, al volver escribiríamos sobre un componente desmontado.
@@ -197,9 +362,17 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
   useEffect(() => {
     montado.current = true;
 
+    // En paralelo y cada una a lo suyo: no se espera a la más lenta ni una
+    // arrastra a la otra si falla.
     void pedirBaseline().then((resultado) => {
       if (montado.current) {
         setCarga(resultado);
+      }
+    });
+
+    void pedirHistorial().then((resultado) => {
+      if (montado.current) {
+        setHistorial(resultado);
       }
     });
 
@@ -210,16 +383,27 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
 
   async function actualizar() {
     setRefrescando(true);
-    const resultado = await pedirBaseline();
+    // Promise.all sin riesgo: ninguna de las dos rechaza, devuelven el fallo
+    // dentro del estado. Se espera a las dos para que el botón no deje de girar
+    // con una todavía en vuelo.
+    const [resultadoBaseline, resultadoHistorial] = await Promise.all([
+      pedirBaseline(),
+      pedirHistorial(),
+    ]);
 
     if (!montado.current) {
       return;
     }
-    setCarga(resultado);
+    setCarga(resultadoBaseline);
+    setHistorial(resultadoHistorial);
     setRefrescando(false);
   }
 
-  if (carga.estado === 'cargando') {
+  // El spinner a pantalla completa solo mientras NO hay nada que enseñar. En
+  // cuanto una de las dos peticiones vuelve se monta la pantalla, y la que siga
+  // en vuelo enseña su propio estado dentro de su bloque. Que una falle no
+  // puede esconder a la otra: son datos distintos de endpoints distintos.
+  if (carga.estado === 'cargando' && historial.estado === 'cargando') {
     return (
       <View style={styles.centrado}>
         <ActivityIndicator />
@@ -228,120 +412,180 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
     );
   }
 
-  if (carga.estado === 'error') {
-    return (
-      <View style={styles.centrado}>
-        {/* Gris y no rojo: que el servidor no responda no es algo que el usuario
-            haya hecho mal. El rojo está reservado a lo que él puede arreglar. */}
-        <Text style={styles.emptyText}>{carga.mensaje}</Text>
+  // Null mientras el baseline no haya llegado o haya fallado. Ya no hay return
+  // temprano por él: el botón "Actualizar" del final hace de reintento.
+  const baseline = carga.estado === 'ok' ? carga.baseline : null;
 
-        <Pressable
-          style={({ pressed }) => [
-            styles.secondaryButton,
-            pressed && styles.buttonPressed,
-            refrescando && styles.buttonDisabled,
-          ]}
-          onPress={actualizar}
-          disabled={refrescando}
-        >
-          {refrescando ? (
-            <ActivityIndicator />
-          ) : (
-            <Text style={styles.secondaryButtonText}>Reintentar</Text>
-          )}
-        </Pressable>
-      </View>
-    );
-  }
+  const metricasListas =
+    baseline !== null && baseline.status === 'ready' && baseline.metrics !== null;
+  const excluidas = describirExcluidas(baseline?.excluded_sessions ?? null);
 
-  const { baseline } = carga;
-  const { scores } = baseline;
+  // Las referencias salen de la OTRA petición. Los dos estados siguen
+  // independientes: si el baseline no está listo, la gráfica se dibuja sin
+  // línea y ya, en vez de esperarlo.
+  const metricasBaseline = baseline !== null && metricasListas ? baseline.metrics : null;
+  const referenciaMuletillas = construirReferencia(metricasBaseline?.filler_rate.baseline);
+  const referenciaRitmo = construirReferencia(metricasBaseline?.words_per_minute.baseline);
 
-  const metricasListas = baseline.status === 'ready' && baseline.metrics !== null;
-  const excluidas = describirExcluidas(baseline.excluded_sessions);
+  const sesiones = historial.estado === 'ok' ? historial.historial.sessions : [];
+  // La sección se oculta entera solo cuando sabemos que no hay ninguna
+  // grabación: dos lienzos vacíos no añaden nada al "llevas 0 de 5" de arriba.
+  const mostrarHistorial = historial.estado !== 'ok' || sesiones.length > 0;
+  // Calculadas aquí y no en el JSX para no repetir la llamada entre la
+  // condición que decide si pintar la línea y el contenido de la línea misma.
+  const exclusionesHistorial = describirExclusionesDelHistorial(sesiones);
+  const alcanceHistorial =
+    historial.estado === 'ok' ? describirAlcance(historial.historial) : null;
 
   const valoraciones =
-    scores.status === 'ready'
+    baseline !== null && baseline.scores.status === 'ready'
       ? [
-          { etiqueta: 'Claridad', comparacion: scores.clarity },
-          { etiqueta: 'Confianza', comparacion: scores.confidence },
-          { etiqueta: 'Ritmo', comparacion: scores.pace },
+          { etiqueta: 'Claridad', comparacion: baseline.scores.clarity },
+          { etiqueta: 'Confianza', comparacion: baseline.scores.confidence },
+          { etiqueta: 'Ritmo', comparacion: baseline.scores.pace },
         ].filter((fila) => fila.comparacion !== null)
       : [];
 
   return (
     <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
-      <Text style={styles.sectionTitle}>Muletillas y ritmo</Text>
+      {baseline === null ? (
+        <>
+          {/* Un bloque solo para las dos secciones: si el baseline no llegó,
+              repetir el mismo mensaje bajo dos títulos sería ruido. */}
+          <Text style={styles.sectionTitle}>Comparación con tu línea base</Text>
 
-      {metricasListas && baseline.metrics !== null ? (
-        <View style={styles.rowsCard}>
-          <ComparisonRow
-            etiqueta="Muletillas"
-            tendencia={ajustarPorFaltaDeSesiones(
-              TENDENCIA_MULETILLAS[baseline.metrics.filler_rate.trend],
-              baseline.metrics.filler_rate
-            )}
-            cifras={construirCifras(baseline.metrics.filler_rate, 'por 100 palabras')}
-          />
-          <ComparisonRow
-            etiqueta="Velocidad"
-            tendencia={ajustarPorFaltaDeSesiones(
-              TENDENCIA_RITMO[baseline.metrics.words_per_minute.trend],
-              baseline.metrics.words_per_minute
-            )}
-            cifras={construirCifras(baseline.metrics.words_per_minute, 'ppm')}
-          />
-        </View>
+          {carga.estado === 'error' ? (
+            <View style={styles.card}>
+              {/* Gris y no rojo: que el servidor no responda no es algo que el
+                  usuario haya hecho mal. El rojo está reservado a lo que él
+                  puede arreglar. Reintentar es el botón del final. */}
+              <Text style={styles.emptyText}>{carga.mensaje}</Text>
+            </View>
+          ) : (
+            <View style={styles.cardCentrada}>
+              <ActivityIndicator />
+            </View>
+          )}
+        </>
       ) : (
-        <View style={styles.card}>
-          <Text style={styles.emptyText}>
-            {describirRecogida(
-              baseline.valid_sessions,
-              baseline.baseline_size,
-              baseline.sessions_needed
-            )}
-          </Text>
-          {excluidas !== null && <Text style={styles.emptyText}>{excluidas}</Text>}
-        </View>
+        <>
+          <Text style={styles.sectionTitle}>Muletillas y ritmo</Text>
+
+          {metricasListas && baseline.metrics !== null ? (
+            <View style={styles.rowsCard}>
+              <ComparisonRow
+                etiqueta="Muletillas"
+                tendencia={ajustarPorFaltaDeSesiones(
+                  TENDENCIA_MULETILLAS[baseline.metrics.filler_rate.trend],
+                  baseline.metrics.filler_rate
+                )}
+                cifras={construirCifras(baseline.metrics.filler_rate, 'por 100 palabras')}
+              />
+              <ComparisonRow
+                etiqueta="Velocidad"
+                tendencia={ajustarPorFaltaDeSesiones(
+                  TENDENCIA_RITMO[baseline.metrics.words_per_minute.trend],
+                  baseline.metrics.words_per_minute
+                )}
+                cifras={construirCifras(baseline.metrics.words_per_minute, 'ppm')}
+              />
+            </View>
+          ) : (
+            <View style={styles.card}>
+              <Text style={styles.emptyText}>
+                {describirRecogida(
+                  baseline.valid_sessions,
+                  baseline.baseline_size,
+                  baseline.sessions_needed
+                )}
+              </Text>
+              {excluidas !== null && <Text style={styles.emptyText}>{excluidas}</Text>}
+            </View>
+          )}
+
+          <Text style={styles.sectionTitle}>Cómo te valora el análisis</Text>
+
+          {valoraciones.length > 0 ? (
+            <View style={styles.rowsCard}>
+              {valoraciones.map(({ etiqueta, comparacion }) =>
+                comparacion === null ? null : (
+                  <ComparisonRow
+                    key={etiqueta}
+                    etiqueta={etiqueta}
+                    tendencia={ajustarPorFaltaDeSesiones(
+                      TENDENCIA_SCORE[comparacion.trend],
+                      comparacion
+                    )}
+                  />
+                )
+              )}
+            </View>
+          ) : (
+            <View style={styles.card}>
+              <Text style={styles.emptyText}>
+                {describirRecogida(
+                  baseline.scores.valid_sessions,
+                  baseline.baseline_size,
+                  baseline.scores.sessions_needed
+                )}
+              </Text>
+
+              {/* Solo cuando las dos secciones van desacompasadas: ver métricas
+                  listas y la valoración a cero parece un error si no se explica
+                  que usan ventanas distintas. */}
+              {metricasListas && (
+                <Text style={styles.emptyText}>
+                  Tus métricas ya están listas. La valoración se calcula aparte y vuelve a
+                  empezar cuando cambia el modelo que analiza tus grabaciones.
+                </Text>
+              )}
+            </View>
+          )}
+        </>
       )}
 
-      <Text style={styles.sectionTitle}>Cómo te valora el análisis</Text>
+      {mostrarHistorial && (
+        <>
+          <Text style={styles.sectionTitle}>Sesión a sesión</Text>
 
-      {valoraciones.length > 0 ? (
-        <View style={styles.rowsCard}>
-          {valoraciones.map(({ etiqueta, comparacion }) =>
-            comparacion === null ? null : (
-              <ComparisonRow
-                key={etiqueta}
-                etiqueta={etiqueta}
-                tendencia={ajustarPorFaltaDeSesiones(
-                  TENDENCIA_SCORE[comparacion.trend],
-                  comparacion
-                )}
+          {historial.estado === 'cargando' && (
+            <View style={styles.cardCentrada}>
+              <ActivityIndicator />
+            </View>
+          )}
+
+          {historial.estado === 'error' && (
+            <View style={styles.card}>
+              <Text style={styles.emptyText}>{historial.mensaje}</Text>
+            </View>
+          )}
+
+          {historial.estado === 'ok' && (
+            <>
+              <MetricChart
+                puntos={construirPuntos(sesiones, 'filler_rate')}
+                unidad="muletillas por 100 palabras"
+                referencia={referenciaMuletillas}
+                descripcion="Evolución de tus muletillas, sesión a sesión."
               />
-            )
-          )}
-        </View>
-      ) : (
-        <View style={styles.card}>
-          <Text style={styles.emptyText}>
-            {describirRecogida(
-              scores.valid_sessions,
-              baseline.baseline_size,
-              scores.sessions_needed
-            )}
-          </Text>
 
-          {/* Solo cuando las dos secciones van desacompasadas: ver métricas
-              listas y la valoración a cero parece un error si no se explica que
-              usan ventanas distintas. */}
-          {metricasListas && (
-            <Text style={styles.emptyText}>
-              Tus métricas ya están listas. La valoración se calcula aparte y vuelve a empezar
-              cuando cambia el modelo que analiza tus grabaciones.
-            </Text>
+              <MetricChart
+                puntos={construirPuntos(sesiones, 'words_per_minute')}
+                unidad="palabras por minuto"
+                referencia={referenciaRitmo}
+                descripcion="Evolución de tu ritmo al hablar, sesión a sesión."
+              />
+
+              {exclusionesHistorial !== null && (
+                <Text style={styles.emptyText}>{exclusionesHistorial}</Text>
+              )}
+
+              {alcanceHistorial !== null && (
+                <Text style={styles.emptyText}>{alcanceHistorial}</Text>
+              )}
+            </>
           )}
-        </View>
+        </>
       )}
 
       <Pressable
@@ -397,6 +641,15 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 16,
     gap: 8,
+  },
+  cardCentrada: {
+    backgroundColor: '#f4f4f5',
+    borderRadius: 8,
+    padding: 16,
+    alignItems: 'center',
+    // Para que la tarjeta no dé un salto de alto al llegar las gráficas.
+    minHeight: 96,
+    justifyContent: 'center',
   },
   rowsCard: {
     backgroundColor: '#f4f4f5',
