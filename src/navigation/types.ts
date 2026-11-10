@@ -41,6 +41,17 @@ export type AppStackParamList = {
    * que pasarle.
    */
   Progress: undefined;
+  /** Todas las grabaciones del usuario, de la más reciente a la más antigua. */
+  Recordings: undefined;
+  /**
+   * Una grabación concreta del historial.
+   *
+   * Recibe solo el id, al revés que Transcription, que recibe el objeto entero:
+   * la lista no tiene la transcripción ni el análisis, así que esta pantalla los
+   * pide. Tener las dos rutas separadas evita que una sola tenga que adivinar si
+   * debe cargar algo o no según lo que le llegue.
+   */
+  RecordingDetail: { recordingId: string };
 };
 
 /** Atajos para tipar las props de cada pantalla: navigation + route ya resueltos. */

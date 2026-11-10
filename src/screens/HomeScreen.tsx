@@ -1,7 +1,14 @@
 /**
  * PANTALLA TEMPORAL — el "hub" del flujo autenticado mientras la app real no
  * existe. Recoge lo que antes hacía App.tsx (mostrar el correo y cerrar sesión)
- * y añade las entradas a la grabación y al progreso.
+ * y añade las entradas al resto de la app.
+ *
+ * PENDIENTE DE UX: con cuatro destinos en una columna de botones, esto se ha
+ * quedado corto. Tres de ellos son secundarios e idénticos, así que ya no hay
+ * jerarquía que leer: el siguiente paso natural es una barra de pestañas
+ * (grabar / grabaciones / progreso) y dejar el cierre de sesión en un ajuste.
+ * No se hace ahora porque implica una dependencia nueva y reestructurar el
+ * stack, y conviene decidirlo a conciencia y no de pasada.
  */
 
 import { useState } from 'react';
@@ -48,8 +55,17 @@ export default function HomeScreen({ navigation }: AppStackScreenProps<'Home'>) 
         <Text style={styles.buttonText}>Grabar voz</Text>
       </Pressable>
 
-      {/* Secundario y no primario: grabar es lo que se viene a hacer aquí, y
-          consultar el progreso es la visita ocasional. */}
+      {/* Secundarios y no primarios: grabar es lo que se viene a hacer aquí, y
+          mirar lo grabado o el progreso son la visita ocasional. En este orden
+          porque es el del recorrido: grabo, reviso lo que grabé, y luego miro
+          cómo voy. */}
+      <Pressable
+        style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]}
+        onPress={() => navigation.navigate('Recordings')}
+      >
+        <Text style={styles.secondaryButtonText}>Mis grabaciones</Text>
+      </Pressable>
+
       <Pressable
         style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]}
         onPress={() => navigation.navigate('Progress')}

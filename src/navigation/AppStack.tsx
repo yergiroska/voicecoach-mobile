@@ -1,5 +1,5 @@
 /**
- * Stack autenticado: home, grabación, el resultado y la evolución del usuario.
+ * Stack autenticado: home, grabación, el resultado, el historial y la evolución.
  *
  * Aquí sí dejamos el header nativo visible, porque es lo que da la flecha de
  * "atrás" y el gesto de swipe en RecordScreen sin escribir nada.
@@ -10,6 +10,8 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import HomeScreen from '../screens/HomeScreen';
 import ProgressScreen from '../screens/ProgressScreen';
 import RecordScreen from '../screens/RecordScreen';
+import RecordingDetailScreen from '../screens/RecordingDetailScreen';
+import RecordingsScreen from '../screens/RecordingsScreen';
 import TranscriptionScreen from '../screens/TranscriptionScreen';
 import type { AppStackParamList } from './types';
 
@@ -38,6 +40,16 @@ export default function AppStack() {
         name="Progress"
         component={ProgressScreen}
         options={{ title: 'Mi progreso' }}
+      />
+      <Stack.Screen
+        name="Recordings"
+        component={RecordingsScreen}
+        options={{ title: 'Mis grabaciones' }}
+      />
+      <Stack.Screen
+        name="RecordingDetail"
+        component={RecordingDetailScreen}
+        options={{ title: 'Grabación' }}
       />
     </Stack.Navigator>
   );

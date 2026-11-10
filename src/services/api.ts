@@ -63,24 +63,27 @@ export function getHealth(): Promise<unknown> {
 }
 
 /**
- * Respuesta de POST /recordings (el `RecordingUploadResponse` del backend).
+ * Lo común a una grabación, venga de subirla o de leerla después.
+ *
+ * El reparto calca el del backend: `filename` existe solo en la respuesta de la
+ * subida y `recorded_at` solo en la del detalle, así que ninguno de los dos
+ * entra aquí. Lo que se pinte sobre esta base sirve para las dos respuestas sin
+ * tener que preguntarse de cuál viene.
  *
  * Se mantienen los nombres en snake_case tal cual llegan por la red: traducir a
  * camelCase obligaría a una capa de mapeo que puede desincronizarse del schema
  * sin que TypeScript se entere.
  */
-export type UploadedRecording = {
-  /** `<uid>_<timestamp>_<aleatorio>`; con esto se pedirá luego el análisis. */
+export type RecordingBase = {
+  /** `<uid>_<timestamp>_<aleatorio>`; identifica la grabación en todo el sistema. */
   recording_id: string;
   /** La transcripción. Cadena vacía si el audio no traía voz: eso no es un error. */
   text: string;
-  /** Nombre con el que el backend guardó el archivo. */
-  filename: string | null;
   /** Tipo MIME normalizado, sin parámetros. */
   content_type: string | null;
   /** Tamaño real recibido, en bytes. */
   size_bytes: number | null;
-  /** Idioma detectado por Whisper (código ISO, p.ej. "es"). */
+  /** Idioma detectado por Whisper. Llega como nombre en inglés ("Spanish"), no como código. */
   language: string | null;
   /** Duración medida por Whisper; puede no cuadrar con la que midió el recorder. */
   duration_seconds: number | null;
@@ -95,6 +98,29 @@ export type UploadedRecording = {
    * error que el propio schema del servidor avisa de no cometer.
    */
   analysis: RecordingAnalysis | null;
+};
+
+/** Respuesta de POST /recordings (el `RecordingUploadResponse` del backend). */
+export type UploadedRecording = RecordingBase & {
+  /**
+   * Nombre con el que el backend guardó el archivo mientras lo procesaba.
+   *
+   * Solo en la subida: no se guarda en la base, y tras una transcripción
+   * correcta nombra un archivo que ya no existe.
+   */
+  filename: string | null;
+};
+
+/** Respuesta de GET /recordings/{id} (el `RecordingDetail` del backend). */
+export type RecordingDetail = RecordingBase & {
+  /**
+   * Cuándo se grabó, en ISO 8601 con zona. Solo en el detalle: al subir era
+   * "ahora" y no hacía falta.
+   *
+   * Se queda como string, igual que `recorded_at` en el historial: convertirlo
+   * a Date aquí sería la capa de mapeo que este módulo evita.
+   */
+  recorded_at: string | null;
 };
 
 /** Una muletilla detectada y las veces que aparece. */
@@ -495,9 +521,13 @@ async function requestAutenticado(path: string): Promise<unknown> {
   return await response.json();
 }
 
-/** Mensaje único para cualquier respuesta que no encaje con el schema. */
+/** Mensaje para una respuesta de POST /recordings que no encaje con el schema. */
 const ERROR_RESPUESTA =
   'El servidor respondió algo que la app no entiende. Vuelve a enviar la grabación.';
+
+/** Lo mismo para el detalle, donde "vuelve a enviarla" no tendría sentido. */
+const ERROR_DETALLE =
+  'El servidor respondió algo que la app no entiende al pedir la grabación.';
 
 /** Devuelve el campo si es un string, o null si falta o es de otro tipo. */
 function leerTexto(datos: Record<string, unknown>, campo: string): string | null {
@@ -648,13 +678,21 @@ function validarAnalisis(valor: unknown): RecordingAnalysis | null {
  * puede omitir, así que exigirlos convertiría un cambio menor del backend en una
  * subida rechazada teniendo la transcripción ya en la mano.
  */
-function validarRespuesta(body: unknown): UploadedRecording {
-  if (typeof body !== 'object' || body === null) {
-    throw new Error(ERROR_RESPUESTA);
+function comoObjeto(body: unknown, mensaje: string): Record<string, unknown> {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new Error(mensaje);
   }
+  return body as Record<string, unknown>;
+}
 
-  const datos = body as Record<string, unknown>;
-
+/**
+ * Los campos que comparten la subida y el detalle.
+ *
+ * El mensaje de fallo entra por parámetro porque lo que el usuario puede hacer
+ * no es lo mismo en los dos casos: tras subir tiene sentido pedirle que lo
+ * reintente, y al abrir una grabación guardada no.
+ */
+function validarCamposComunes(datos: Record<string, unknown>, mensaje: string): RecordingBase {
   const recording_id = leerTexto(datos, 'recording_id');
   const text = leerTexto(datos, 'text');
 
@@ -662,19 +700,36 @@ function validarRespuesta(body: unknown): UploadedRecording {
   // en silencio devuelve "" legítimamente y la pantalla lo resuelve con un estado
   // vacío. Rechazarlo aquí sería tratar una grabación válida como un fallo.
   if (recording_id === null || text === null) {
-    throw new Error(ERROR_RESPUESTA);
+    throw new Error(mensaje);
   }
 
   return {
     recording_id,
     text,
-    filename: leerTexto(datos, 'filename'),
     content_type: leerTexto(datos, 'content_type'),
     size_bytes: leerNumero(datos, 'size_bytes'),
     language: leerTexto(datos, 'language'),
     duration_seconds: leerNumero(datos, 'duration_seconds'),
     model: leerTexto(datos, 'model'),
     analysis: validarAnalisis(datos.analysis),
+  };
+}
+
+function validarRespuesta(body: unknown): UploadedRecording {
+  const datos = comoObjeto(body, ERROR_RESPUESTA);
+
+  return {
+    ...validarCamposComunes(datos, ERROR_RESPUESTA),
+    filename: leerTexto(datos, 'filename'),
+  };
+}
+
+function validarDetalle(body: unknown): RecordingDetail {
+  const datos = comoObjeto(body, ERROR_DETALLE);
+
+  return {
+    ...validarCamposComunes(datos, ERROR_DETALLE),
+    recorded_at: leerTexto(datos, 'recorded_at'),
   };
 }
 
@@ -986,4 +1041,20 @@ const SESIONES_POR_DEFECTO = 30;
  */
 export async function getHistory(limit: number = SESIONES_POR_DEFECTO): Promise<History> {
   return validarHistorial(await requestAutenticado(`/me/history?limit=${limit}`));
+}
+/**
+ * GET /recordings/{id} — una grabación ya guardada, con su transcripción y su
+ * análisis.
+ *
+ * Un 404 llega con el `detail` del backend ("Grabación no encontrada.") y no
+ * recibe trato especial: desde la app no hay forma de pedir un id inexistente,
+ * porque la lista sale de /me/history, que solo contiene grabaciones guardadas,
+ * y el flujo de subida pinta el objeto que ya tiene en lugar de volver a pedirlo.
+ *
+ * @throws Error con un mensaje ya presentable al usuario si algo falla.
+ */
+export async function getRecording(recordingId: string): Promise<RecordingDetail> {
+  return validarDetalle(
+    await requestAutenticado(`/recordings/${encodeURIComponent(recordingId)}`)
+  );
 }
