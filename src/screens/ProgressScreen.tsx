@@ -345,6 +345,20 @@ async function pedirHistorial(): Promise<EstadoHistorial> {
   }
 }
 
+/**
+ * Lo que queda en un bloque tras pulsar "Actualizar".
+ *
+ * Si el bloque ya tenía contenido y la petición nueva falla, se conserva lo que
+ * había: sigue siendo válido, y cambiarlo por un mensaje de error por un fallo
+ * de red es peor que no haber refrescado. Es el mismo criterio que el
+ * pull-to-refresh de la lista de grabaciones. En cualquier otro caso manda el
+ * resultado nuevo, así que desde un error "Actualizar" sigue sirviendo de
+ * reintento.
+ */
+function fusionarRefresco<T extends { estado: string }>(anterior: T, nuevo: T): T {
+  return anterior.estado === 'ok' && nuevo.estado === 'error' ? anterior : nuevo;
+}
+
 export default function ProgressScreen({ navigation }: AppStackScreenProps<'Progress'>) {
   const [carga, setCarga] = useState<EstadoCarga>({ estado: 'cargando' });
   // Separado del estado: al actualizar, la pantalla NO vuelve a 'cargando'. Si
@@ -354,6 +368,10 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
   // Su propio estado, no uno compartido: si el historial falla, las
   // comparaciones de arriba siguen en pantalla.
   const [historial, setHistorial] = useState<EstadoHistorial>({ estado: 'cargando' });
+  // Algún bloque conservó su contenido porque el último "Actualizar" falló. No se
+  // borra al empezar a refrescar, sino cuando un refresco termina sin conservar
+  // nada: así el aviso no parpadea mientras gira el botón.
+  const [falloRefresco, setFalloRefresco] = useState(false);
 
   // La petición sigue viva aunque el usuario se vaya de la pantalla; sin esta
   // comprobación, al volver escribiríamos sobre un componente desmontado.
@@ -394,8 +412,17 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
     if (!montado.current) {
       return;
     }
-    setCarga(resultadoBaseline);
-    setHistorial(resultadoHistorial);
+
+    // Cada bloque decide por su cuenta. El estado se fusiona con el valor más
+    // reciente (forma funcional), y el aviso se calcula con el que había al
+    // pulsar. Solo difieren si la carga inicial de un bloque termina mientras se
+    // refresca, y ahí lo peor que pasa es que el aviso no salga.
+    const conservaBaseline = carga.estado === 'ok' && resultadoBaseline.estado === 'error';
+    const conservaHistorial = historial.estado === 'ok' && resultadoHistorial.estado === 'error';
+
+    setCarga((anterior) => fusionarRefresco(anterior, resultadoBaseline));
+    setHistorial((anterior) => fusionarRefresco(anterior, resultadoHistorial));
+    setFalloRefresco(conservaBaseline || conservaHistorial);
     setRefrescando(false);
   }
 
@@ -587,6 +614,11 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
           )}
         </>
       )}
+
+      {/* Encima del botón y no arriba del todo, como en la lista: aquí el
+          contenido va en un scroll y el botón está al final, así que un aviso
+          arriba quedaría fuera de la vista de quien acaba de pulsarlo. */}
+      {falloRefresco && <Text style={styles.emptyText}>No se pudo actualizar.</Text>}
 
       <Pressable
         style={({ pressed }) => [

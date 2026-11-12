@@ -6,6 +6,8 @@
  * process.env['EXPO_PUBLIC_...'] o desestructurar NO funciona.
  */
 
+import { FirebaseError } from 'firebase/app';
+
 import { auth } from './firebase';
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL;
@@ -19,6 +21,11 @@ const TIMEOUT_MS = 8000;
  */
 const UPLOAD_TIMEOUT_MS = 60000;
 
+/**
+ * Error de configuración, no de red: solo lo ve quien desarrolla con un .env
+ * incompleto. Por eso sigue siendo un Error normal y no un ApiError, y su texto
+ * habla de archivos y variables.
+ */
 function requireApiUrl(): string {
   if (!API_URL) {
     throw new Error(
@@ -28,33 +35,232 @@ function requireApiUrl(): string {
   return API_URL;
 }
 
-async function request(path: string): Promise<unknown> {
+/**
+ * Qué clase de fallo fue, para que una pantalla pueda decidir sin leer el texto.
+ *
+ * - `sin-conexion`: fetch ni siquiera obtuvo respuesta.
+ * - `timeout`: la petición salió, pero no volvió a tiempo.
+ * - `sesion`: no hay usuario, el token no se pudo obtener o el backend dio 401.
+ * - `servidor`: el backend respondió con un error (4xx que no es 401, o 5xx).
+ *   `status` dice cuál.
+ * - `respuesta`: el backend respondió 2xx, pero con algo que la app no entiende.
+ */
+export type TipoErrorApi = 'sin-conexion' | 'timeout' | 'sesion' | 'servidor' | 'respuesta';
+
+/**
+ * Todo lo que lanzan las funciones exportadas de este módulo, salvo el error de
+ * configuración de requireApiUrl.
+ *
+ * `message` es SIEMPRE presentable tal cual: sin URL, sin IP, sin códigos de
+ * estado y sin la causa interna de fetch. Lo técnico va a console.warn.
+ * `status` tampoco se enseña; está para la lógica.
+ */
+export class ApiError extends Error {
+  readonly tipo: TipoErrorApi;
+  readonly status: number | null;
+
+  constructor(tipo: TipoErrorApi, mensaje: string, status: number | null = null) {
+    super(mensaje);
+    this.name = 'ApiError';
+    this.tipo = tipo;
+    this.status = status;
+    // Al heredar de Error, según cómo se transpile la clase, el prototipo puede
+    // quedarse en el de Error y romper `instanceof ApiError`. Esto lo fija.
+    Object.setPrototypeOf(this, ApiError.prototype);
+  }
+}
+
+/**
+ * Qué se estaba haciendo. Varios textos cambian según el caso: tras un fallo de
+ * subida tiene sentido hablar de "enviar la grabación", y al leer el historial
+ * no.
+ */
+type Contexto = 'lectura' | 'subida';
+
+const MENSAJE_SIN_CONEXION: Record<Contexto, string> = {
+  lectura:
+    'No se pudo conectar con el servidor. Comprueba tu conexión a internet e inténtalo de nuevo.',
+  subida:
+    'No se pudo enviar la grabación porque no hay conexión con el servidor. ' +
+    'Comprueba tu conexión a internet e inténtalo de nuevo.',
+};
+
+const MENSAJE_TIMEOUT: Record<Contexto, string> = {
+  lectura: 'El servidor está tardando demasiado en responder. Inténtalo de nuevo en un momento.',
+  subida: 'El envío está tardando demasiado. Comprueba tu conexión e inténtalo de nuevo.',
+};
+
+const MENSAJE_SESION_CADUCADA =
+  'Tu sesión ha caducado. Vuelve a iniciar sesión e inténtalo de nuevo.';
+
+const MENSAJE_SIN_SESION = 'No hay ninguna sesión iniciada. Vuelve a iniciar sesión.';
+
+const MENSAJE_SESION_NO_COMPROBADA =
+  'No se pudo comprobar tu sesión. Vuelve a iniciar sesión e inténtalo de nuevo.';
+
+/**
+ * Para cualquier 5xx, incluido el 503. El backend manda su propio `detail` en
+ * varios ("La base de datos no está disponible…"), pero al usuario le da igual
+ * qué pieza falló: lo único que puede hacer es esperar y reintentar.
+ */
+const MENSAJE_SERVICIO_NO_DISPONIBLE =
+  'El servicio no está disponible ahora mismo. Inténtalo de nuevo en unos minutos.';
+
+const MENSAJE_PETICION_FALLIDA = 'No se pudo completar la petición. Inténtalo de nuevo.';
+
+/** Mensaje por defecto de un 2xx que no es JSON, cuando el llamador no da uno propio. */
+const MENSAJE_RESPUESTA_ILEGIBLE = 'No se pudo leer la respuesta del servidor.';
+
+/**
+ * Estados cuyo `detail` del backend se enseña tal cual, siempre que sea un string.
+ *
+ * Son los que el backend escribe a mano y en español: "Grabación no encontrada.",
+ * "El audio supera el tamaño máximo permitido (25 MB).", "El audio no se pudo
+ * transcribir…". Fuera quedan el 415, cuyo `detail` lista tipos MIME, y el 422
+ * de validación de FastAPI, que llega como array con mensajes de Pydantic en
+ * inglés: leerDetalleEscrito devuelve null para ese y se usa el texto propio.
+ */
+const ESTADOS_CON_DETALLE_PRESENTABLE: ReadonlySet<number> = new Set([404, 413, 422]);
+
+/** El texto propio de un 4xx que no es 401, cuando el `detail` no sirve. */
+function mensajeDeEstado(status: number, contexto: Contexto): string {
+  switch (status) {
+    case 404:
+      return 'No se encontró la grabación.';
+    case 413:
+      return 'La grabación es demasiado grande para enviarla.';
+    case 415:
+      return 'Este formato de audio no se puede enviar.';
+    case 422:
+      return contexto === 'subida'
+        ? 'No se pudo procesar la grabación. Vuelve a enviarla.'
+        : MENSAJE_PETICION_FALLIDA;
+    default:
+      return contexto === 'subida'
+        ? 'No se pudo enviar la grabación. Inténtalo de nuevo.'
+        : MENSAJE_PETICION_FALLIDA;
+  }
+}
+
+/**
+ * fetch contra el backend con timeout, traduciendo los fallos de transporte a
+ * ApiError. Es el único sitio de la app que llama a fetch.
+ *
+ * Recibe la ruta y no la URL para que lo que va a console.warn sea solo eso: la
+ * ruta, sin la IP del backend.
+ *
+ * Ojo con lo que se registra: ni las cabeceras (llevan el token) ni el cuerpo
+ * (la respuesta de una grabación lleva la transcripción). Solo ruta y causa.
+ *
+ * `rutaLog` es la ruta tal y como se registra, si no debe ser la real: la del
+ * detalle lleva el recording_id, que empieza por el uid de Firebase.
+ */
+async function fetchConTimeout(
+  path: string,
+  init: RequestInit,
+  timeoutMs: number,
+  contexto: Contexto,
+  rutaLog: string = path
+): Promise<Response> {
   const baseUrl = requireApiUrl();
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(`${baseUrl}${path}`, {
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText} en ${path}`);
-    }
-
-    return await response.json();
+    return await fetch(`${baseUrl}${path}`, { ...init, signal: controller.signal });
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(
-        `Timeout tras ${TIMEOUT_MS / 1000}s al llamar a ${baseUrl}${path}. ` +
-          '¿El backend sigue corriendo y el móvil está en la misma red?'
-      );
+    // Se mira la señal y no el nombre del error: en React Native el rechazo por
+    // abort es un DOMException de polyfill, y fiarse de su forma es más frágil
+    // que preguntar si fuimos nosotros quienes abortamos.
+    if (controller.signal.aborted) {
+      console.warn(`[api] ${rutaLog}: sin respuesta tras ${timeoutMs / 1000} s`);
+      throw new ApiError('timeout', MENSAJE_TIMEOUT[contexto]);
     }
-    throw error;
+
+    const causa = error instanceof Error ? error.message : String(error);
+    console.warn(`[api] ${rutaLog}: no se pudo conectar (${causa})`);
+    throw new ApiError('sin-conexion', MENSAJE_SIN_CONEXION[contexto]);
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * El `detail` de un error de FastAPI, solo si es un string.
+ *
+ * Los HTTPException del router lo traen como string escrito a mano. Los 422 de
+ * validación lo traen como array con mensajes de Pydantic en inglés, y para esos
+ * se devuelve null a propósito: no son presentables. Un cuerpo que no es JSON
+ * (el HTML de error de un proxy, por ejemplo) también da null.
+ */
+async function leerDetalleEscrito(response: Response): Promise<string | null> {
+  try {
+    const body: unknown = await response.json();
+    if (typeof body !== 'object' || body === null || !('detail' in body)) {
+      return null;
+    }
+    const { detail } = body as { detail: unknown };
+    return typeof detail === 'string' && detail.trim() !== '' ? detail : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convierte una respuesta no-ok en un ApiError presentable.
+ *
+ * Se registra la ruta y el estado, pero no el `detail`: es parte del cuerpo, y
+ * la regla de este módulo es no sacar el cuerpo a los logs.
+ */
+async function errorDeRespuesta(
+  response: Response,
+  path: string,
+  contexto: Contexto
+): Promise<ApiError> {
+  const { status } = response;
+  console.warn(`[api] ${path}: el servidor respondió ${status}`);
+
+  if (status === 401) {
+    // El detail del backend aquí es técnico ("Token de Firebase inválido o
+    // expirado."); al usuario le sirve más saber qué tiene que hacer.
+    return new ApiError('sesion', MENSAJE_SESION_CADUCADA, status);
+  }
+
+  if (status >= 500) {
+    return new ApiError('servidor', MENSAJE_SERVICIO_NO_DISPONIBLE, status);
+  }
+
+  const detalle = ESTADOS_CON_DETALLE_PRESENTABLE.has(status)
+    ? await leerDetalleEscrito(response)
+    : null;
+
+  return new ApiError('servidor', detalle ?? mensajeDeEstado(status, contexto), status);
+}
+
+/**
+ * El cuerpo JSON de una respuesta 2xx.
+ *
+ * Sin esto, un 200 con HTML (un portal cautivo, un proxy) llegaría a la pantalla
+ * como el "JSON Parse error: Unexpected character" del motor.
+ */
+async function leerJson(response: Response, path: string, mensaje: string): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    console.warn(`[api] ${path}: la respuesta no es JSON`);
+    throw new ApiError('respuesta', mensaje, response.status);
+  }
+}
+
+async function request(path: string): Promise<unknown> {
+  const response = await fetchConTimeout(path, {}, TIMEOUT_MS, 'lectura');
+
+  if (!response.ok) {
+    throw await errorDeRespuesta(response, path, 'lectura');
+  }
+
+  return await leerJson(response, path, MENSAJE_RESPUESTA_ILEGIBLE);
 }
 
 /** GET /health — comprueba que el backend responde. */
@@ -376,158 +582,89 @@ function describirArchivo(uri: string): { name: string; type: string } {
   const type = MIME_POR_EXTENSION[extension];
 
   if (!type) {
-    throw new Error(
-      `No se reconoce el formato del audio (${extension ? `.${extension}` : 'sin extensión'}). ` +
-        'El servidor solo acepta m4a, mp4 y webm.'
-    );
+    // Un Error normal y no un ApiError: no ha habido ninguna petición. La
+    // extensión va al log y no al texto, que el usuario no sabría qué hacer con ella.
+    console.warn(`[api] formato de audio no reconocido: ${extension || '(sin extensión)'}`);
+    throw new Error('Este formato de audio no se puede enviar.');
   }
 
   return { name: `recording.${extension}`, type };
 }
 
-/** Token de Firebase para el header Authorization. */
-async function obtenerToken(): Promise<string> {
+/**
+ * Token de Firebase para el header Authorization.
+ *
+ * Los mensajes no nombran ninguna operación: esto corre igual antes de subir
+ * que antes de leer el progreso o el historial.
+ */
+async function obtenerToken(contexto: Contexto): Promise<string> {
   const user = auth.currentUser;
   if (!user) {
-    throw new Error('No hay sesión iniciada. Vuelve a entrar para subir la grabación.');
+    console.warn('[api] petición autenticada sin usuario en sesión');
+    throw new ApiError('sesion', MENSAJE_SIN_SESION);
   }
 
   try {
     // getIdToken() refresca solo si el token está a punto de caducar; si la
     // sesión ya no vale, falla aquí en vez de provocar un 401 más adelante.
     return await user.getIdToken();
-  } catch {
-    throw new Error(
-      'No se pudo validar tu sesión. Vuelve a iniciar sesión e inténtalo de nuevo.'
-    );
-  }
-}
+  } catch (error) {
+    const codigo = error instanceof FirebaseError ? error.code : 'desconocido';
+    console.warn(`[api] no se pudo obtener el token de sesión (${codigo})`);
 
-/**
- * Extrae el `detail` de un error de FastAPI: un string en los HTTPException que
- * lanza el router (401, 413, 415) y un array de objetos en los 422 de
- * validación. Si el cuerpo no es ninguna de las dos cosas devuelve null, y el
- * llamador se queda con el status, que es mejor que un mensaje inventado.
- */
-async function extraerDetalle(response: Response): Promise<string | null> {
-  try {
-    const body: unknown = await response.json();
-    if (typeof body !== 'object' || body === null || !('detail' in body)) {
-      return null;
+    // Refrescar el token es una petición a Firebase: sin red falla aquí, y eso
+    // no es una sesión inválida. Mandar a alguien sin cobertura a iniciar sesión
+    // de nuevo no le arreglaría nada.
+    if (codigo === 'auth/network-request-failed') {
+      throw new ApiError('sin-conexion', MENSAJE_SIN_CONEXION[contexto]);
     }
-
-    const { detail } = body as { detail: unknown };
-
-    if (typeof detail === 'string') {
-      return detail;
-    }
-
-    if (Array.isArray(detail)) {
-      const mensajes = detail
-        .map((item) =>
-          typeof item === 'object' && item !== null && 'msg' in item
-            ? String((item as { msg: unknown }).msg)
-            : null
-        )
-        .filter((msg): msg is string => msg !== null);
-      return mensajes.length > 0 ? mensajes.join('; ') : null;
-    }
-
-    return null;
-  } catch {
-    // Cuerpo vacío o que no es JSON (p.ej. el HTML de error de un proxy).
-    return null;
-  }
-}
-
-/**
- * Traduce el status a algo que se pueda enseñar tal cual en la pantalla.
- *
- * `accion` solo entra en el caso por defecto, que es el único mensaje que nombra
- * la operación. Con el valor por defecto, quien ya llamaba a esta función sigue
- * obteniendo exactamente el mismo texto.
- */
-function mensajeDeError(
-  status: number,
-  detalle: string | null,
-  accion = 'al subir la grabación'
-): string {
-  switch (status) {
-    case 401:
-      // El detail del backend aquí es técnico ("token inválido o expirado"); al
-      // usuario le sirve más saber qué tiene que hacer.
-      return 'Tu sesión caducó. Vuelve a iniciar sesión e inténtalo de nuevo.';
-    case 413:
-      return detalle ?? 'La grabación supera el tamaño máximo permitido (25 MB).';
-    case 415:
-      return detalle ?? 'El servidor no acepta el formato de este audio.';
-    case 422:
-      return detalle ?? 'El servidor no encontró el archivo en la petición.';
-    case 503:
-      return (
-        detalle ?? 'El servidor no puede validar sesiones ahora mismo. Inténtalo en un momento.'
-      );
-    default:
-      return detalle ?? `El servidor respondió ${status} ${accion}.`;
+    throw new ApiError('sesion', MENSAJE_SESION_NO_COMPROBADA);
   }
 }
 
 /**
  * GET autenticado contra el backend.
  *
- * Reúne las cuatro cosas que hasta ahora solo existían dentro de
- * uploadRecording: el token de Firebase, el timeout manual, la extracción del
- * `detail` de FastAPI y su traducción a un mensaje enseñable. Sin esto, cada
- * endpoint nuevo volvería a copiarlas.
+ * Junta el token de Firebase, fetchConTimeout y la traducción de la respuesta a
+ * ApiError, que es lo que necesita cada endpoint de lectura.
  *
- * No sustituye a request(): ese sirve a /health, que es público y cuyo error
- * crudo no llega a ninguna pantalla.
+ * `mensajeIlegible` es el texto si el cuerpo no es JSON: cada endpoint tiene el
+ * suyo, el mismo que usa su validación, para que el usuario lea lo mismo falle
+ * en un paso o en el otro.
+ *
+ * `rutaLog` es lo que se registra en lugar de `path`; ver fetchConTimeout.
  *
  * Devuelve `unknown` a propósito. Validar el cuerpo es de quien sabe qué forma
  * espera, no de la capa de transporte.
  */
-async function requestAutenticado(path: string): Promise<unknown> {
-  const baseUrl = requireApiUrl();
-  const token = await obtenerToken();
+async function requestAutenticado(
+  path: string,
+  mensajeIlegible: string,
+  rutaLog: string = path
+): Promise<unknown> {
+  const token = await obtenerToken('lectura');
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-  let response: Response;
-  try {
-    response = await fetch(`${baseUrl}${path}`, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(
-        `Timeout tras ${TIMEOUT_MS / 1000}s al llamar a ${baseUrl}${path}. ` +
-          '¿El backend sigue corriendo y el móvil está en la misma red?'
-      );
-    }
-    const causa = error instanceof Error ? error.message : String(error);
-    throw new Error(`No se pudo conectar con el servidor (${causa}).`);
-  } finally {
-    clearTimeout(timeout);
-  }
+  const response = await fetchConTimeout(
+    path,
+    { headers: { Authorization: `Bearer ${token}` } },
+    TIMEOUT_MS,
+    'lectura',
+    rutaLog
+  );
 
   if (!response.ok) {
-    throw new Error(
-      mensajeDeError(response.status, await extraerDetalle(response), 'al consultar el servidor')
-    );
+    throw await errorDeRespuesta(response, rutaLog, 'lectura');
   }
 
-  return await response.json();
+  return await leerJson(response, rutaLog, mensajeIlegible);
 }
 
 /** Mensaje para una respuesta de POST /recordings que no encaje con el schema. */
 const ERROR_RESPUESTA =
-  'El servidor respondió algo que la app no entiende. Vuelve a enviar la grabación.';
+  'No se pudo leer la respuesta del servidor. Vuelve a enviar la grabación.';
 
 /** Lo mismo para el detalle, donde "vuelve a enviarla" no tendría sentido. */
-const ERROR_DETALLE =
-  'El servidor respondió algo que la app no entiende al pedir la grabación.';
+const ERROR_DETALLE = 'No se pudo leer la grabación que devolvió el servidor.';
 
 /** Devuelve el campo si es un string, o null si falta o es de otro tipo. */
 function leerTexto(datos: Record<string, unknown>, campo: string): string | null {
@@ -680,7 +817,7 @@ function validarAnalisis(valor: unknown): RecordingAnalysis | null {
  */
 function comoObjeto(body: unknown, mensaje: string): Record<string, unknown> {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    throw new Error(mensaje);
+    throw new ApiError('respuesta', mensaje);
   }
   return body as Record<string, unknown>;
 }
@@ -700,7 +837,7 @@ function validarCamposComunes(datos: Record<string, unknown>, mensaje: string): 
   // en silencio devuelve "" legítimamente y la pantalla lo resuelve con un estado
   // vacío. Rechazarlo aquí sería tratar una grabación válida como un fallo.
   if (recording_id === null || text === null) {
-    throw new Error(mensaje);
+    throw new ApiError('respuesta', mensaje);
   }
 
   return {
@@ -738,12 +875,13 @@ function validarDetalle(body: unknown): RecordingDetail {
  *
  * @param uri URI local (file://) que devuelve el recorder al detenerse.
  * @returns La grabación guardada con su transcripción ya resuelta por el backend.
- * @throws Error con un mensaje ya presentable al usuario si algo falla.
+ * @throws ApiError con un mensaje ya presentable al usuario si algo falla en la
+ *   petición, o Error si el formato del archivo no se reconoce.
  */
 export async function uploadRecording(uri: string): Promise<UploadedRecording> {
-  const baseUrl = requireApiUrl();
+  const path = '/recordings';
   const { name, type } = describirArchivo(uri);
-  const token = await obtenerToken();
+  const token = await obtenerToken('subida');
 
   const formData = new FormData();
   // React Native no tiene File/Blob apuntando al sistema de archivos: su
@@ -753,42 +891,28 @@ export async function uploadRecording(uri: string): Promise<UploadedRecording> {
   // admiten string | Blob; de ahí el cast.
   formData.append('file', { uri, name, type } as unknown as Blob);
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
-
-  let response: Response;
-  try {
-    response = await fetch(`${baseUrl}/recordings`, {
+  const response = await fetchConTimeout(
+    path,
+    {
       method: 'POST',
       // Sin Content-Type a propósito: lo pone fetch con el boundary del
       // multipart. Escribirlo a mano ("multipart/form-data", sin boundary) es
       // el error clásico que deja al backend sin poder parsear el cuerpo.
       headers: { Authorization: `Bearer ${token}` },
       body: formData,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(
-        `La subida se canceló tras ${UPLOAD_TIMEOUT_MS / 1000}s sin respuesta. ` +
-          'Comprueba la conexión y vuelve a intentarlo.'
-      );
-    }
-    const causa = error instanceof Error ? error.message : String(error);
-    throw new Error(`No se pudo conectar con el servidor para subir la grabación (${causa}).`);
-  } finally {
-    clearTimeout(timeout);
-  }
+    },
+    UPLOAD_TIMEOUT_MS,
+    'subida'
+  );
 
   if (!response.ok) {
-    throw new Error(mensajeDeError(response.status, await extraerDetalle(response)));
+    throw await errorDeRespuesta(response, path, 'subida');
   }
 
-  return validarRespuesta(await response.json());
+  return validarRespuesta(await leerJson(response, path, ERROR_RESPUESTA));
 }
 /** Mensaje para una respuesta de /me/baseline que no se puede interpretar. */
-const ERROR_BASELINE =
-  'El servidor respondió algo que la app no entiende al pedir tu progreso.';
+const ERROR_BASELINE = 'No se pudo leer tu progreso. Inténtalo de nuevo.';
 
 const ESTADOS: readonly BaselineStatus[] = ['collecting', 'ready'];
 
@@ -906,7 +1030,7 @@ function validarScoresBaseline(datos: Record<string, unknown> | null): ScoresBas
  */
 function validarBaseline(body: unknown): Baseline {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    throw new Error(ERROR_BASELINE);
+    throw new ApiError('respuesta', ERROR_BASELINE);
   }
 
   const datos = body as Record<string, unknown>;
@@ -926,14 +1050,13 @@ function validarBaseline(body: unknown): Baseline {
 /**
  * GET /me/baseline — la línea base del usuario y su evolución reciente.
  *
- * @throws Error con un mensaje ya presentable al usuario si algo falla.
+ * @throws ApiError con un mensaje ya presentable al usuario si algo falla.
  */
 export async function getBaseline(): Promise<Baseline> {
-  return validarBaseline(await requestAutenticado('/me/baseline'));
+  return validarBaseline(await requestAutenticado('/me/baseline', ERROR_BASELINE));
 }
 /** Mensaje para una respuesta de /me/history que no se puede interpretar. */
-const ERROR_HISTORIAL =
-  'El servidor respondió algo que la app no entiende al pedir tu historial.';
+const ERROR_HISTORIAL = 'No se pudo leer tu historial. Inténtalo de nuevo.';
 
 const MOTIVOS_EXCLUSION: readonly ExcludedReason[] = [
   'not_analyzed',
@@ -1005,7 +1128,7 @@ function validarSesion(valor: unknown): HistorySession | null {
  */
 function validarHistorial(body: unknown): History {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    throw new Error(ERROR_HISTORIAL);
+    throw new ApiError('respuesta', ERROR_HISTORIAL);
   }
 
   const datos = body as Record<string, unknown>;
@@ -1037,10 +1160,12 @@ const SESIONES_POR_DEFECTO = 30;
 /**
  * GET /me/history — las sesiones más recientes, una por punto de gráfica.
  *
- * @throws Error con un mensaje ya presentable al usuario si algo falla.
+ * @throws ApiError con un mensaje ya presentable al usuario si algo falla.
  */
 export async function getHistory(limit: number = SESIONES_POR_DEFECTO): Promise<History> {
-  return validarHistorial(await requestAutenticado(`/me/history?limit=${limit}`));
+  return validarHistorial(
+    await requestAutenticado(`/me/history?limit=${limit}`, ERROR_HISTORIAL)
+  );
 }
 /**
  * GET /recordings/{id} — una grabación ya guardada, con su transcripción y su
@@ -1051,10 +1176,15 @@ export async function getHistory(limit: number = SESIONES_POR_DEFECTO): Promise<
  * porque la lista sale de /me/history, que solo contiene grabaciones guardadas,
  * y el flujo de subida pinta el objeto que ya tiene en lugar de volver a pedirlo.
  *
- * @throws Error con un mensaje ya presentable al usuario si algo falla.
+ * @throws ApiError con un mensaje ya presentable al usuario si algo falla.
  */
 export async function getRecording(recordingId: string): Promise<RecordingDetail> {
   return validarDetalle(
-    await requestAutenticado(`/recordings/${encodeURIComponent(recordingId)}`)
+    await requestAutenticado(
+      `/recordings/${encodeURIComponent(recordingId)}`,
+      ERROR_DETALLE,
+      // El id empieza por el uid de Firebase y no aporta nada para depurar.
+      '/recordings/{id}'
+    )
   );
 }

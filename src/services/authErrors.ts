@@ -40,8 +40,21 @@ const MENSAJES: Record<string, string> = {
 
 export function mensajeDeErrorAuth(error: unknown): string {
   if (error instanceof FirebaseError) {
-    return MENSAJES[error.code] ?? `No se pudo completar la operación (${error.code}).`;
+    const mensaje = MENSAJES[error.code];
+    if (mensaje !== undefined) {
+      return mensaje;
+    }
+
+    // Un código que el mapa no cubre: al usuario no le dice nada, pero es lo
+    // que hace falta para añadirlo al mapa. Solo el código: es lo único que se
+    // necesita para traducirlo.
+    console.warn(`[auth] código de Firebase sin traducir: ${error.code}`);
+    return 'No se pudo completar la operación. Inténtalo de nuevo.';
   }
 
+  // Solo el nombre, nunca el `message`: en Login y Register podría arrastrar el
+  // correo que escribió el usuario. Si ni siquiera es un Error, basta el tipo.
+  const nombre = error instanceof Error ? error.name : typeof error;
+  console.warn(`[auth] error inesperado: ${nombre}`);
   return 'Ocurrió un error inesperado. Inténtalo de nuevo.';
 }

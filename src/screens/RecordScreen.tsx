@@ -58,6 +58,36 @@ type EstadoSubida =
   | { estado: 'ok'; grabacion: UploadedRecording }
   | { estado: 'error'; mensaje: string };
 
+const MENSAJE_ERROR_EMPEZAR = 'No se pudo empezar a grabar. Inténtalo de nuevo.';
+
+/**
+ * Sin "inténtalo de nuevo" y sin prometer nada: si stop() falló, no sabemos si
+ * el archivo quedó bien cerrado, y decir que se guardó sería mentir.
+ */
+const MENSAJE_ERROR_DETENER = 'No se pudo detener la grabación. Puede que no se haya guardado.';
+
+/** Para el log: el nombre y el mensaje del error nativo, que no llevan datos del usuario. */
+function describirFallo(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : typeof error;
+}
+
+/**
+ * Avisa de que la grabación no se cerró bien cuando la pantalla ya se ha ido.
+ *
+ * Tiene que ser un diálogo y no el recuadro de la pantalla, porque la pantalla
+ * ya no está. Alert.alert no hace nada en react-native-web, de ahí la rama.
+ */
+function avisarCierreFallido() {
+  const titulo = 'La grabación no se cerró bien';
+  const cuerpo = 'Puede que no se haya guardado.';
+
+  if (Platform.OS === 'web') {
+    window.alert(`${titulo}. ${cuerpo}`);
+    return;
+  }
+  Alert.alert(titulo, cuerpo);
+}
+
 export default function RecordScreen({ navigation }: AppStackScreenProps<'Record'>) {
   const {
     isRecording,
@@ -73,6 +103,9 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
   // transición y el recorder nativo queda en un estado inconsistente.
   const [ocupado, setOcupado] = useState(false);
   const [subida, setSubida] = useState<EstadoSubida>({ estado: 'inactiva' });
+  // Fallo del recorder al empezar o al detener. Va aparte de `subida` porque es
+  // otro momento del flujo: puede fallar el grabador sin que haya subida alguna.
+  const [errorGrabadora, setErrorGrabadora] = useState<string | null>(null);
 
   const subiendo = subida.estado === 'subiendo';
   // Se calcula aquí y no en el JSX para no repetir la llamada entre la condición
@@ -84,16 +117,28 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
   const bloqueado = ocupado || subiendo;
 
   async function alternarGrabacion() {
+    // Se fija ANTES del await: si se leyera isRecording en el catch, el recorder
+    // ya podría haber cambiado de estado y el mensaje saldría al revés.
+    const deteniendo = isRecording;
+
+    // Cada pulsación es un intento nuevo: el aviso del anterior ya no aplica.
+    setErrorGrabadora(null);
     setOcupado(true);
     try {
-      if (isRecording) {
+      if (deteniendo) {
         await stopRecording();
       } else {
         // Una grabación nueva invalida el resultado de la subida anterior.
         setSubida({ estado: 'inactiva' });
         await startRecording();
       }
+    } catch (error) {
+      console.warn(
+        `[grabadora] no se pudo ${deteniendo ? 'detener' : 'empezar'} (${describirFallo(error)})`
+      );
+      setErrorGrabadora(deteniendo ? MENSAJE_ERROR_DETENER : MENSAJE_ERROR_EMPEZAR);
     } finally {
+      // Siempre, haya ido bien o mal: si no, el botón se quedaría deshabilitado.
       setOcupado(false);
     }
   }
@@ -139,12 +184,23 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
   usePreventRemove(isRecording, ({ data }) => {
     async function detenerYSalir() {
       setOcupado(true);
+      let fallo = false;
       try {
         await stopRecording();
+      } catch (error) {
+        fallo = true;
+        console.warn(`[grabadora] no se pudo detener al salir (${describirFallo(error)})`);
       } finally {
         // En el finally, no después del await: si stop() falla no queremos
-        // dejar al usuario atrapado en la pantalla.
+        // dejar al usuario atrapado en la pantalla. No se libera `ocupado`
+        // porque la pantalla se desmonta con esta misma acción.
         navigation.dispatch(data.action);
+      }
+
+      // Después de salir, no antes: el aviso no debe frenar la salida que el
+      // usuario ya confirmó.
+      if (fallo) {
+        avisarCierreFallido();
       }
     }
 
@@ -184,6 +240,14 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
       >
         <Text style={styles.buttonText}>{isRecording ? 'Detener' : 'Grabar'}</Text>
       </Pressable>
+
+      {/* Mismo recuadro que el aviso de permiso: los dos dicen que el grabador
+          no hizo lo que se le pidió. */}
+      {errorGrabadora !== null && (
+        <View style={styles.warning}>
+          <Text style={styles.warningText}>{errorGrabadora}</Text>
+        </View>
+      )}
 
       {permissionDenied && (
         <View style={styles.warning}>
