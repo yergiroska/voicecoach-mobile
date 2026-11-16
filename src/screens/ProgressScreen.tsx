@@ -473,9 +473,26 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
         ].filter((fila) => fila.comparacion !== null)
       : [];
 
+  // Si las dos peticiones fallaron por lo mismo (sin conexión, timeout, servicio
+  // caído), el mismo texto saldría dos veces bajo dos títulos. Entonces va una
+  // sola tarjeta y sin títulos: ninguno de los dos sería cierto para ambas.
+  // Con textos distintos cada fallo dice algo propio y se quedan las dos.
+  const errorComun =
+    carga.estado === 'error' &&
+    historial.estado === 'error' &&
+    carga.mensaje === historial.mensaje
+      ? carga.mensaje
+      : null;
+
   return (
     <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
-      {baseline === null ? (
+      {errorComun !== null && (
+        <View style={styles.card}>
+          <Text style={[styles.emptyText, styles.textoEnTarjeta]}>{errorComun}</Text>
+        </View>
+      )}
+
+      {errorComun === null && (baseline === null ? (
         <>
           {/* Un bloque solo para las dos secciones: si el baseline no llegó,
               repetir el mismo mensaje bajo dos títulos sería ruido. */}
@@ -486,7 +503,7 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
               {/* Gris y no rojo: que el servidor no responda no es algo que el
                   usuario haya hecho mal. El rojo está reservado a lo que él
                   puede arreglar. Reintentar es el botón del final. */}
-              <Text style={styles.emptyText}>{carga.mensaje}</Text>
+              <Text style={[styles.emptyText, styles.textoEnTarjeta]}>{carga.mensaje}</Text>
             </View>
           ) : (
             <View style={styles.cardCentrada}>
@@ -519,14 +536,16 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
             </View>
           ) : (
             <View style={styles.card}>
-              <Text style={styles.emptyText}>
+              <Text style={[styles.emptyText, styles.textoEnTarjeta]}>
                 {describirRecogida(
                   baseline.valid_sessions,
                   baseline.baseline_size,
                   baseline.sessions_needed
                 )}
               </Text>
-              {excluidas !== null && <Text style={styles.emptyText}>{excluidas}</Text>}
+              {excluidas !== null && (
+                <Text style={[styles.emptyText, styles.textoEnTarjeta]}>{excluidas}</Text>
+              )}
             </View>
           )}
 
@@ -549,7 +568,7 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
             </View>
           ) : (
             <View style={styles.card}>
-              <Text style={styles.emptyText}>
+              <Text style={[styles.emptyText, styles.textoEnTarjeta]}>
                 {describirRecogida(
                   baseline.scores.valid_sessions,
                   baseline.baseline_size,
@@ -561,7 +580,7 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
                   listas y la valoración a cero parece un error si no se explica
                   que usan ventanas distintas. */}
               {metricasListas && (
-                <Text style={styles.emptyText}>
+                <Text style={[styles.emptyText, styles.textoEnTarjeta]}>
                   Tus métricas ya están listas. La valoración se calcula aparte y vuelve a
                   empezar cuando cambia el modelo que analiza tus grabaciones.
                 </Text>
@@ -569,9 +588,9 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
             </View>
           )}
         </>
-      )}
+      ))}
 
-      {mostrarHistorial && (
+      {errorComun === null && mostrarHistorial && (
         <>
           <Text style={styles.sectionTitle}>Sesión a sesión</Text>
 
@@ -583,7 +602,7 @@ export default function ProgressScreen({ navigation }: AppStackScreenProps<'Prog
 
           {historial.estado === 'error' && (
             <View style={styles.card}>
-              <Text style={styles.emptyText}>{historial.mensaje}</Text>
+              <Text style={[styles.emptyText, styles.textoEnTarjeta]}>{historial.mensaje}</Text>
             </View>
           )}
 
@@ -695,6 +714,12 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     color: '#71717a',
     textAlign: 'center',
+  },
+  // Para el texto gris DENTRO de una tarjeta: sobre su fondo #f4f4f5, el #71717a
+  // queda en unos 4,4:1 y no llega al 4,5:1 de AA. Fuera de tarjeta, sobre
+  // blanco, emptyText sí cumple y se queda como está.
+  textoEnTarjeta: {
+    color: '#52525b',
   },
   secondaryButton: {
     backgroundColor: '#e4e4e7',

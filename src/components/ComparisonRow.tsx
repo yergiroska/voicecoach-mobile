@@ -124,17 +124,21 @@ const styles = StyleSheet.create({
   tonoNeutro: {
     color: '#3f3f46',
   },
+  // La fila va siempre dentro de una tarjeta #f4f4f5, donde #71717a no llega al
+  // 4,5:1 de AA. Con #52525b el gris queda cerca del de `neutro` (#3f3f46), así
+  // que "sin dato" se separa por el peso: normal frente al seminegrita del resto.
   tonoSinDato: {
-    color: '#71717a',
+    color: '#52525b',
+    fontWeight: '400',
   },
   cifras: {
     fontSize: 13,
-    color: '#71717a',
+    color: '#52525b',
     flexShrink: 1,
   },
   delta: {
     fontSize: 13,
-    color: '#71717a',
+    color: '#52525b',
     // Alinea las cifras de las filas que van una debajo de otra.
     fontVariant: ['tabular-nums'],
   },

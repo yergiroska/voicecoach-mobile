@@ -162,13 +162,16 @@ const styles = StyleSheet.create({
     padding: 16,
     gap: 8,
   },
+  // Los dos textos van dentro de la tarjeta #f4f4f5: #52525b y no #71717a, que
+  // ahí no llega al 4,5:1 de AA. GRIS_REFERENCIA no cambia: es el trazo de la
+  // línea y su etiqueta va sobre el fondo blanco del área de dibujo.
   unidad: {
     fontSize: 12,
-    color: '#71717a',
+    color: '#52525b',
     textAlign: 'right',
   },
   vacio: {
     fontSize: 14,
-    color: '#71717a',
+    color: '#52525b',
   },
 });

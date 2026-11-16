@@ -42,46 +42,78 @@ const MOTIVO_EXCLUSION: Record<ExcludedReason, string> = {
 };
 
 /**
- * Fecha y hora de una grabación.
+ * Día y hora de una grabación, por separado: la fila los une con "·" y el
+ * lector de pantalla con "a las". Null si el string no es una fecha válida.
+ *
+ * El año solo se omite si es el actual. Una grabación de un año anterior lo
+ * lleva siempre: sin él, "16/11" se leería como de este año.
  *
  * Compuesta a mano y no con toLocaleDateString, por lo de siempre: el soporte
  * de Intl en Hermes no es igual en las dos plataformas.
  */
-function formatearFechaHora(iso: string): string {
+function formatearFechaHora(
+  iso: string,
+  anioActual: number
+): { dia: string; hora: string } | null {
   const fecha = new Date(iso);
 
   if (Number.isNaN(fecha.getTime())) {
-    return '';
+    return null;
   }
 
-  const dia = `${fecha.getDate()}/${fecha.getMonth() + 1}/${fecha.getFullYear()}`;
-  const hora = `${String(fecha.getHours()).padStart(2, '0')}:${String(fecha.getMinutes()).padStart(2, '0')}`;
-  return `${dia} · ${hora}`;
+  const anio = fecha.getFullYear();
+  const diaMes = `${fecha.getDate()}/${fecha.getMonth() + 1}`;
+  return {
+    dia: anio === anioActual ? diaMes : `${diaMes}/${anio}`,
+    hora: `${String(fecha.getHours()).padStart(2, '0')}:${String(fecha.getMinutes()).padStart(2, '0')}`,
+  };
 }
 
 /**
- * Lo que se enseña a la derecha de la fila.
+ * Lo que se enseña a la derecha de la fila, y cómo se lee en voz alta.
  *
  * Una sesión inválida no trae métricas, así que en su lugar va el motivo. Y una
  * válida puede no tener ritmo —si el audio no trajo duración— sin dejar de
  * contar para lo demás: por eso se arma la frase con lo que haya en vez de dar
  * por hecho que están los dos datos.
+ *
+ * `lectura` existe porque el lector de pantalla deletrearía "ppm" y se tropieza
+ * con el "·".
  */
-function describirSesion(sesion: HistorySession): { texto: string; atenuado: boolean } {
+function describirSesion(sesion: HistorySession): {
+  texto: string;
+  lectura: string;
+  atenuado: boolean;
+} {
   if (!sesion.valid) {
     const motivo = sesion.excluded_reason === null ? null : MOTIVO_EXCLUSION[sesion.excluded_reason];
-    return { texto: motivo ?? 'no cuenta', atenuado: true };
+    const texto = motivo ?? 'no cuenta';
+    return { texto, lectura: texto, atenuado: true };
   }
 
   const partes: string[] = [];
+  const partesLeidas: string[] = [];
   if (sesion.word_count !== null) {
     partes.push(`${sesion.word_count} palabras`);
+    partesLeidas.push(`${sesion.word_count} palabras`);
   }
   if (sesion.words_per_minute !== null) {
-    partes.push(`${Math.round(sesion.words_per_minute)} ppm`);
+    const ppm = Math.round(sesion.words_per_minute);
+    partes.push(`${ppm} ppm`);
+    partesLeidas.push(`${ppm} palabras por minuto`);
   }
 
-  return { texto: partes.join(' · '), atenuado: false };
+  return { texto: partes.join(' · '), lectura: partesLeidas.join(', '), atenuado: false };
+}
+
+/** "Grabación del 16/11 a las 14:05. 123 palabras, 140 palabras por minuto." */
+function etiquetaDeFila(
+  cuando: { dia: string; hora: string } | null,
+  lectura: string
+): string {
+  const inicio =
+    cuando === null ? 'Grabación sin fecha' : `Grabación del ${cuando.dia} a las ${cuando.hora}`;
+  return lectura === '' ? `${inicio}.` : `${inicio}. ${lectura}.`;
 }
 
 type EstadoCarga =
@@ -202,6 +234,9 @@ export default function RecordingsScreen({ navigation }: AppStackScreenProps<'Re
 
   const { historial } = carga;
 
+  // Una vez por render y no por fila: todas las filas comparan contra el mismo año.
+  const anioActual = new Date().getFullYear();
+
   return (
     <View style={styles.lista}>
       {/* Fuera de la FlatList, no en un ListHeaderComponent: así el aviso no se
@@ -215,8 +250,8 @@ export default function RecordingsScreen({ navigation }: AppStackScreenProps<'Re
         keyExtractor={(sesion) => sesion.recording_id}
         refreshControl={<RefreshControl refreshing={refrescando} onRefresh={refrescar} />}
         renderItem={({ item }) => {
-          const { texto, atenuado } = describirSesion(item);
-          const cuando = formatearFechaHora(item.recorded_at);
+          const { texto, lectura, atenuado } = describirSesion(item);
+          const cuando = formatearFechaHora(item.recorded_at, anioActual);
 
           return (
             <Pressable
@@ -225,16 +260,26 @@ export default function RecordingsScreen({ navigation }: AppStackScreenProps<'Re
                 navigation.navigate('RecordingDetail', { recordingId: item.recording_id })
               }
               accessibilityRole="button"
-              accessibilityLabel={`Grabación del ${cuando}. ${texto}.`}
+              accessibilityLabel={etiquetaDeFila(cuando, lectura)}
             >
-              <Text style={styles.cuando}>{cuando}</Text>
-              <Text style={[styles.detalle, atenuado && styles.detalleApagado]}>{texto}</Text>
+              {/* Si la fila no da para las dos cosas, cede la fecha con puntos
+                  suspensivos: los datos de la derecha son los que se comparan
+                  de una fila a otra y no deben partirse. */}
+              <Text style={styles.cuando} numberOfLines={1}>
+                {cuando === null ? '' : `${cuando.dia} · ${cuando.hora}`}
+              </Text>
+              <Text
+                style={[styles.detalle, atenuado && styles.detalleApagado]}
+                numberOfLines={1}
+              >
+                {texto}
+              </Text>
             </Pressable>
           );
         }}
         ListEmptyComponent={
           <View style={styles.tarjeta}>
-            <Text style={styles.apagado}>
+            <Text style={[styles.apagado, styles.apagadoEnTarjeta]}>
               Todavía no has grabado nada. Cuando grabes, tus sesiones aparecerán aquí.
             </Text>
           </View>
@@ -288,18 +333,23 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '500',
     color: '#18181b',
+    // La fecha es la que cede si la fila no cabe. Antes era al revés, y en un
+    // móvil de 360 dp "123 palabras · 140 ppm" bajaba a dos líneas.
+    flexShrink: 1,
   },
   detalle: {
     fontSize: 13,
     color: '#3f3f46',
-    // El texto de la derecha es el que cede si la fila no cabe.
-    flexShrink: 1,
+    // Ancho natural siempre: con numberOfLines={1} esto es lo que garantiza que
+    // los datos queden en una línea y enteros.
+    flexShrink: 0,
     textAlign: 'right',
   },
   // Las inválidas solo cambian el color del motivo; la fila entera se deja
-  // igual de legible porque se puede abrir como cualquier otra.
+  // igual de legible porque se puede abrir como cualquier otra. #52525b y no
+  // #71717a: sobre el gris de la fila, el segundo no llega a 4,5:1.
   detalleApagado: {
-    color: '#71717a',
+    color: '#52525b',
   },
   tarjeta: {
     backgroundColor: '#f4f4f5',
@@ -325,6 +375,10 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     color: '#71717a',
     textAlign: 'center',
+  },
+  // El estado vacío va dentro de una tarjeta gris: ahí #71717a no llega a 4,5:1.
+  apagadoEnTarjeta: {
+    color: '#52525b',
   },
   button: {
     backgroundColor: '#e4e4e7',

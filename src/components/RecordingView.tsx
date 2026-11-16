@@ -67,6 +67,36 @@ function formatearFecha(iso: string | null | undefined): string | null {
   return `${dia} · ${hora}`;
 }
 
+/**
+ * Los idiomas más probables, en español.
+ *
+ * El backend manda lo que devuelve Whisper: hoy el nombre en inglés
+ * ("Spanish"), pero se acepta también el código de dos letras por si cambia de
+ * formato. Corta a propósito: un idioma que no esté aquí se enseña tal cual, que
+ * es como se enseñaban todos antes, así que olvidarse de uno no rompe nada.
+ */
+const NOMBRE_IDIOMA: Record<string, string> = {
+  spanish: 'Español',
+  es: 'Español',
+  english: 'Inglés',
+  en: 'Inglés',
+  portuguese: 'Portugués',
+  pt: 'Portugués',
+  french: 'Francés',
+  fr: 'Francés',
+  italian: 'Italiano',
+  it: 'Italiano',
+  german: 'Alemán',
+  de: 'Alemán',
+  catalan: 'Catalán',
+  ca: 'Catalán',
+};
+
+/** El idioma en español si está en la tabla, sin mirar mayúsculas; si no, tal cual. */
+function traducirIdioma(idioma: string): string {
+  return NOMBRE_IDIOMA[idioma.trim().toLowerCase()] ?? idioma;
+}
+
 type Metadato = { etiqueta: string; valor: string };
 
 /**
@@ -76,12 +106,14 @@ type Metadato = { etiqueta: string; valor: string };
  * apoyo, así que aquí se omite la fila en vez de enseñar un hueco o un
  * "desconocido" que no aporta nada. La fecha sigue la misma regla y además solo
  * existe en el detalle.
+ *
+ * `model` (el de Whisper) no se enseña, por lo mismo que `analysis.model`: es
+ * trazabilidad de ingeniería, no algo que le diga nada a quien habló.
  */
 function recogerMetadatos(
   grabacion: {
     language: string | null;
     duration_seconds: number | null;
-    model: string | null;
   },
   fecha: string | null | undefined
 ): Metadato[] {
@@ -92,15 +124,10 @@ function recogerMetadatos(
     metadatos.push({ etiqueta: 'Fecha', valor: cuando });
   }
   if (grabacion.language !== null) {
-    // Se muestra tal cual lo manda el backend, que hoy devuelve el nombre en
-    // inglés ("Spanish"): traducirlo exigiría una tabla que habría que mantener.
-    metadatos.push({ etiqueta: 'Idioma', valor: grabacion.language });
+    metadatos.push({ etiqueta: 'Idioma', valor: traducirIdioma(grabacion.language) });
   }
   if (grabacion.duration_seconds !== null) {
     metadatos.push({ etiqueta: 'Duración', valor: formatearDuracion(grabacion.duration_seconds) });
-  }
-  if (grabacion.model !== null) {
-    metadatos.push({ etiqueta: 'Modelo', valor: grabacion.model });
   }
 
   return metadatos;
@@ -372,9 +399,12 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     gap: 12,
   },
+  // Los grises de este componente van todos dentro de tarjetas #f4f4f5, donde
+  // #71717a se queda en unos 4,4:1 y no llega al 4,5:1 de AA. De ahí #52525b
+  // aquí, en desglose, viñeta y emptyText.
   metaLabel: {
     fontSize: 13,
-    color: '#71717a',
+    color: '#52525b',
   },
   metaValue: {
     fontSize: 13,
@@ -416,7 +446,7 @@ const styles = StyleSheet.create({
   },
   desglose: {
     fontSize: 12,
-    color: '#71717a',
+    color: '#52525b',
   },
   logro: {
     fontSize: 14,
@@ -436,7 +466,7 @@ const styles = StyleSheet.create({
   vineta: {
     fontSize: 15,
     lineHeight: 22,
-    color: '#71717a',
+    color: '#52525b',
   },
   sugerenciaTexto: {
     // Sin esto el texto no envuelve: se sale de la fila en vez de partir línea.
@@ -454,6 +484,6 @@ const styles = StyleSheet.create({
   },
   emptyText: {
     fontSize: 14,
-    color: '#71717a',
+    color: '#52525b',
   },
 });

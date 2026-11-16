@@ -23,29 +23,29 @@ function formatearDuracion(millis: number): string {
   return `${minutos}:${String(segundos).padStart(2, '0')}`;
 }
 
-/** Bytes a KB/MB, para comprobar de un vistazo que subió lo que se grabó. */
+/**
+ * Bytes a KB/MB, con coma decimal como el resto de cifras de la app.
+ */
 function formatearTamano(bytes: number): string {
   if (bytes < 1024) {
     return `${bytes} B`;
   }
   const kb = bytes / 1024;
-  return kb < 1024 ? `${Math.round(kb)} KB` : `${(kb / 1024).toFixed(1)} MB`;
+  return kb < 1024
+    ? `${Math.round(kb)} KB`
+    : `${(kb / 1024).toFixed(1).replace('.', ',')} MB`;
 }
 
 /**
- * Tamaño y tipo tal y como los recibió el servidor, saltándose lo que no llegue.
+ * "Tamaño: 1,2 MB", tal y como lo recibió el servidor, o null si no llegó.
  *
- * Los dos campos son opcionales desde que api.ts valida la respuesta en vez de
- * castearla: solo `recording_id` y `text` se dan por seguros. Devuelve null si
- * no queda nada que enseñar, y entonces la línea entera desaparece en vez de
- * dejar un "0 B ·" a medias.
+ * El tipo MIME y el recording_id se enseñaban aquí para comprobar las subidas a
+ * mano, pero al usuario no le dicen nada: el id, además, empieza por su uid.
+ * `size_bytes` es opcional desde que api.ts valida la respuesta, y si falta la
+ * línea desaparece en vez de dejar un "Tamaño:" vacío.
  */
-function describirEnvio({ size_bytes, content_type }: UploadedRecording): string | null {
-  const partes = [size_bytes !== null ? formatearTamano(size_bytes) : null, content_type].filter(
-    (parte): parte is string => parte !== null
-  );
-
-  return partes.length > 0 ? partes.join(' · ') : null;
+function describirEnvio({ size_bytes }: UploadedRecording): string | null {
+  return size_bytes !== null ? `Tamaño: ${formatearTamano(size_bytes)}` : null;
 }
 
 /**
@@ -264,38 +264,32 @@ export default function RecordScreen({ navigation }: AppStackScreenProps<'Record
           arriba ya es la información relevante. */}
       {recording !== null && !isRecording && (
         <View style={styles.result}>
-          <Text style={styles.resultTitle}>Grabación guardada</Text>
+          {/* Solo antes de enviarla: después, el recuadro verde ya dice
+              "Grabación enviada" y los dos títulos se contradirían. */}
+          {subida.estado !== 'ok' && (
+            <Text style={styles.resultTitle}>Grabación lista para enviar</Text>
+          )}
           <Text style={styles.resultLine}>
             Duración: {formatearDuracion(recording.durationMillis)}
-          </Text>
-          {/* La URI es un file:// en el caché de la app; se muestra para poder
-              comprobar a mano que la grabación existe. */}
-          <Text style={styles.resultUri} numberOfLines={2}>
-            {recording.uri}
           </Text>
 
           {/* Una vez subida se retira el botón en vez de deshabilitarlo: no hay
               motivo para volver a mandar el mismo archivo. */}
           {subida.estado === 'ok' ? (
             <View style={styles.success}>
-              <Text style={styles.successTitle}>Enviada al servidor</Text>
+              <Text style={styles.successTitle}>Grabación enviada</Text>
               {detalleEnvio !== null && <Text style={styles.successLine}>{detalleEnvio}</Text>}
-              {/* selectable para poder copiar el ID y buscar la grabación en el
-                  backend mientras se prueba a mano. */}
-              <Text style={styles.successId} selectable numberOfLines={2}>
-                {subida.grabacion.recording_id}
-              </Text>
 
-              {/* Al subir ya se abrió la transcripción sola; esto es la reentrada
-                  para quien retrocedió hasta aquí y quiere releerla sin tener que
-                  grabar otra vez. */}
+              {/* Al subir ya se abrió el resultado solo; esto es la reentrada
+                  para quien retrocedió hasta aquí y quiere releerlo sin tener que
+                  grabar otra vez. "Resultado" es el título de esa pantalla. */}
               <Pressable
                 onPress={() =>
                   navigation.navigate('Transcription', { grabacion: subida.grabacion })
                 }
                 hitSlop={8}
               >
-                <Text style={[styles.link, styles.successLink]}>Ver transcripción</Text>
+                <Text style={[styles.link, styles.successLink]}>Ver resultado</Text>
               </Pressable>
             </View>
           ) : (
@@ -424,10 +418,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#3f3f46',
   },
-  resultUri: {
-    fontSize: 11,
-    color: '#71717a',
-  },
   uploadButton: {
     backgroundColor: '#16a34a',
     borderRadius: 8,
@@ -459,10 +449,6 @@ const styles = StyleSheet.create({
   successLine: {
     fontSize: 13,
     color: '#166534',
-  },
-  successId: {
-    fontSize: 11,
-    color: '#4d7c0f',
   },
   // El recuadro usa gap: 2 para apretar los datos; el enlace es una acción y
   // necesita separarse de ellos.
